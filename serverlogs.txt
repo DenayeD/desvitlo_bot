@@ -1,0 +1,16 @@
+
+Jan 20 12:57:09 desvitlo-bot python[229617]:   File "/home/dendiachuk/desvitlo_bot/venv/lib/python3.12/site-packages/aiogram/methods/base.py", line 82, in emit
+Jan 20 12:57:09 desvitlo-bot python[229617]:     return await bot(self)
+Jan 20 12:57:09 desvitlo-bot python[229617]:            ^^^^^^^^^^^^^^^
+Jan 20 12:57:09 desvitlo-bot python[229617]:   File "/home/dendiachuk/desvitlo_bot/venv/lib/python3.12/site-packages/aiogram/client/bot.py", line 484, in __call__
+Jan 20 12:57:09 desvitlo-bot python[229617]:     return await self.session(self, method, timeout=request_timeout)
+Jan 20 12:57:09 desvitlo-bot python[229617]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Jan 20 12:57:09 desvitlo-bot python[229617]:   File "/home/dendiachuk/desvitlo_bot/venv/lib/python3.12/site-packages/aiogram/client/session/base.py", line 259, in __call__
+Jan 20 12:57:09 desvitlo-bot python[229617]:     return cast(TelegramType, await middleware(bot, method))
+Jan 20 12:57:09 desvitlo-bot python[229617]:                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Jan 20 12:57:09 desvitlo-bot python[229617]:   File "/home/dendiachuk/desvitlo_bot/venv/lib/python3.12/site-packages/aiogram/client/session/aiohttp.py", line 177, in make_request
+Jan 20 12:57:09 desvitlo-bot python[229617]:     response = self.check_response(
+Jan 20 12:57:09 desvitlo-bot python[229617]:                ^^^^^^^^^^^^^^^^^^^^
+Jan 20 12:57:09 desvitlo-bot python[229617]:   File "/home/dendiachuk/desvitlo_bot/venv/lib/python3.12/site-packages/aiogram/client/session/base.py", line 121, in check_response
+Jan 20 12:57:09 desvitlo-bot python[229617]:     raise TelegramBadRequest(method=method, message=description)
+Jan 20 12:57:09 desvitlo-bot python[229617]: aiogram.exceptions.TelegramBadRequest: Telegram server says - Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message
