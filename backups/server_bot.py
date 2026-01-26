@@ -48,13 +48,6 @@ class AddressStates(StatesGroup):
     waiting_for_edit_name = State()
     waiting_for_edit_queue = State()
 
-class ManualScheduleStates(StatesGroup):
-    waiting_for_date = State()
-    waiting_for_subqueue = State()
-    waiting_for_guaranteed = State()
-    waiting_for_possible = State()
-    waiting_for_confirm = State()
-
 # --- БАЗА ДАНИХ (ОНОВЛЕНО) ---
 def init_db():
     conn = sqlite3.connect('users.db')
@@ -81,18 +74,6 @@ def init_db():
         new_schedule_enabled BOOLEAN DEFAULT 1,
         schedule_changes_enabled BOOLEAN DEFAULT 1,
         PRIMARY KEY (user_id, address_name)
-    )''')
-    
-    # Ручні графіки для адмінів
-    cursor.execute('''CREATE TABLE IF NOT EXISTS manual_schedules (
-        date TEXT,
-        subqueue TEXT,
-        guaranteed_text TEXT,
-        possible_text TEXT,
-        admin_id INTEGER,
-        created_at TEXT,
-        updated_at TEXT,
-        PRIMARY KEY (date, subqueue)
     )''')
     
     # Міграція наявних користувачів
@@ -275,103 +256,6 @@ def init_user_notification_settings(user_id):
     if not settings:
         set_user_notification_settings(user_id, None, True, True, True)
 
-# --- РУЧНІ ГРАФІКИ ---
-def init_manual_schedules_table():
-    """Створює таблицю для ручних графіків якщо її немає"""
-    try:
-        conn = sqlite3.connect('users.db')
-        cursor = conn.cursor()
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS manual_schedules (
-                id INTEGER PRIMARY KEY,
-                date TEXT NOT NULL,
-                subqueue TEXT NOT NULL,
-                guaranteed_text TEXT,
-                possible_text TEXT,
-                created_by INTEGER,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                is_active BOOLEAN DEFAULT 1,
-                UNIQUE(date, subqueue)
-            )
-        ''')
-        conn.commit()
-        conn.close()
-        logging.info("Manual schedules table initialized")
-    except Exception as e:
-        logging.error(f"Error creating manual_schedules table: {e}")
-
-def get_manual_schedule(date, subqueue):
-    """Отримує ручний графік для дати та черги"""
-    try:
-        conn = sqlite3.connect('users.db')
-        cursor = conn.cursor()
-        cursor.execute('''
-            SELECT guaranteed_text, possible_text, admin_id, created_at
-            FROM manual_schedules
-            WHERE date = ? AND subqueue = ?
-        ''', (date, subqueue))
-        res = cursor.fetchone()
-        conn.close()
-        if res:
-            return {
-                'guaranteed_text': res[0] or '',
-                'possible_text': res[1] or '',
-                'created_by': res[2],
-                'created_at': res[3]
-            }
-        return None
-    except Exception as e:
-        logging.error(f"Error getting manual schedule for {date}, {subqueue}: {e}")
-        return None
-
-def set_manual_schedule(date, subqueue, guaranteed_text, possible_text, user_id):
-    """Створює або оновлює ручний графік"""
-    try:
-        conn = sqlite3.connect('users.db')
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT OR REPLACE INTO manual_schedules
-            (date, subqueue, guaranteed_text, possible_text, admin_id, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-        ''', (date, subqueue, guaranteed_text, possible_text, user_id))
-        conn.commit()
-        conn.close()
-        logging.info(f"Manual schedule set for {date}, {subqueue} by user {user_id}")
-        return True
-    except Exception as e:
-        logging.error(f"Error setting manual schedule: {e}")
-        return False
-
-def delete_manual_schedule(date, subqueue):
-    """Видаляє ручний графік"""
-    try:
-        conn = sqlite3.connect('users.db')
-        cursor = conn.cursor()
-        cursor.execute('''
-            DELETE FROM manual_schedules
-            WHERE date = ? AND subqueue = ?
-        ''', (date, subqueue))
-        conn.commit()
-        conn.close()
-        logging.info(f"Manual schedule deactivated for {date}, {subqueue}")
-        return True
-    except Exception as e:
-        logging.error(f"Error deleting manual schedule: {e}")
-        return False
-
-def get_combined_schedule(date, subqueue, site_data=None):
-    """Отримує комбінований графік: гарантовані з сайту + ймовірні з ручних"""
-    # Отримуємо дані з сайту (синхронно, використовуючи глобальні дані або кеш)
-    # Поки що повертаємо тільки ручні дані, пізніше додамо інтеграцію з сайтом
-    manual = get_manual_schedule(date, subqueue)
-    
-    return {
-        'guaranteed': '',
-        'possible': manual['possible_text'] if manual else '',
-        'source': 'manual' if manual else 'none'
-    }
-
 # --- ЛОГІКА ТА ПАРСИНГ ---
 def check_light_status(schedule_text):
     now = datetime.now().time()
@@ -434,44 +318,25 @@ async def parse_hoe_smart():
 
                     img_url = "https://hoe.com.ua" + img['src']
                     
-                    # Витягуємо timestamp з назви файлу для порівняння свіжості
-                    filename = img_url.split('/')[-1]  # file20260124035522426.png
-                    timestamp = 0
-                    if filename.startswith('file') and filename.endswith('.png'):
-                        # file20260124035522426.png -> 20260124035522426
-                        ts_str = filename[4:-4]  # remove 'file' and '.png'
-                        try:
-                            # Це timestamp в форматі YYYYMMDDHHMMSSmmm
-                            timestamp = int(ts_str)
-                        except ValueError:
-                            timestamp = 0
-                    
                     # Шукаємо список <ul>, який йде ПІСЛЯ цієї картинки
-                    schedules = {}
                     ul = img.find_next('ul')
+                    schedules = {}
                     if ul:
-                        for li in ul.find_all('li'):
-                            li_text = li.get_text()
-                            match = re.search(r"підчерга (\d\.\d) [–\-\—\−] (.*)", li_text)
-                            if match:
-                                subq, schedule = match.groups()
-                                schedules[subq] = normalize_schedule_text(schedule)
+                        text = ul.get_text()
+                        patterns = re.findall(r"підчерга (\d\.\d) [–\-\—\−] (.*?)(?:;|\n|$)", text)
+                        schedules = {p[0]: p[1].strip() for p in patterns}
 
-                    # Якщо для цієї дати вже є запис, порівнюємо за timestamp (свіжіший виграє)
-                    if date_key not in data_by_date or timestamp > data_by_date[date_key].get('timestamp', 0):
-                        data_by_date[date_key] = {
-                            "img": img_url,
-                            "list": schedules,
-                            "raw_date": alt_text,
-                            "has_image": True,
-                            "timestamp": timestamp
-                        }
+                    data_by_date[date_key] = {
+                        "img": img_url,
+                        "list": schedules,
+                        "raw_date": alt_text
+                    }
                 return data_by_date
         except Exception as e:
             logging.error(f"Парсинг error: {e}")
             return {}
 
-def generate_clock_image(subqueue, guaranteed_text, possible_text="", date_info=""):
+def generate_clock_image(subqueue, time_text, date_info):
     # Створюємо зображення годинника
     os.makedirs('clocks', exist_ok=True)
     filename = f"clocks/{subqueue}_{date_info.replace('.', '_')}.png"
@@ -504,15 +369,15 @@ def generate_clock_image(subqueue, guaranteed_text, possible_text="", date_info=
     # Спроба завантажити шрифт (для Linux сервера)
     try:
         # Спробуємо arial.ttf в поточній папці (якщо завантажено)
-        font = ImageFont.truetype('arial.ttf', 32)  # Збільшено до 36
+        font = ImageFont.truetype('arial.ttf', 36)  # Збільшено до 36
     except:
         try:
             # Системний шрифт для Linux
-            font = ImageFont.truetype('/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf', 32)
+            font = ImageFont.truetype('/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf', 36)
         except:
             try:
                 # Альтернативний системний шрифт
-                font = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', 32)
+                font = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', 36)
             except:
                 # Якщо нічого не працює, використовуємо default
                 font = ImageFont.load_default()
@@ -548,10 +413,9 @@ def generate_clock_image(subqueue, guaranteed_text, possible_text="", date_info=
             draw.text((cx, cy), str(hour), fill=(255, 255, 255), font=font)
     
     # Парсимо інтервали відключень
-    # Гарантовані відключення - червоним
-    guaranteed_intervals = re.findall(r"(\d{2}:\d{2})[–\-\—\−](\d{2}:\d{2})", guaranteed_text.replace("з ", "").replace(" до ", "-"))
+    intervals = re.findall(r"(\d{2}:\d{2})[–\-\—\−](\d{2}:\d{2})", time_text.replace("з ", "").replace(" до ", "-"))
     
-    for start_str, end_str in guaranteed_intervals:
+    for start_str, end_str in intervals:
         try:
             start_h, start_m = map(int, start_str.split(':'))
             end_h, end_m = map(int, end_str.split(':'))
@@ -562,35 +426,9 @@ def generate_clock_image(subqueue, guaranteed_text, possible_text="", date_info=
             if end_angle < start_angle:
                 end_angle += 360
             
-            # Малюємо дугу гарантованого відключення (червоним)
+            # Малюємо дугу відключення (невелику)
             draw.arc((center - radius + 20, center - radius + 20, center + radius - 20, center + radius - 20),
                      start=start_angle, end=end_angle, fill=(255, 100, 100), width=40)
-            # Додаємо обведення
-            draw.arc((center - radius + 20, center - radius + 20, center + radius - 20, center + radius - 20),
-                     start=start_angle, end=end_angle, fill=None, outline=(0, 0, 0), width=4)
-        except:
-            continue
-    
-    # Ймовірні відключення - сірим
-    possible_intervals = re.findall(r"(\d{2}:\d{2})[–\-\—\−](\d{2}:\d{2})", possible_text.replace("з ", "").replace(" до ", "-"))
-    
-    for start_str, end_str in possible_intervals:
-        try:
-            start_h, start_m = map(int, start_str.split(':'))
-            end_h, end_m = map(int, end_str.split(':'))
-            
-            start_angle = (start_h * 15 + start_m * 0.25) - 90
-            end_angle = (end_h * 15 + end_m * 0.25) - 90
-            
-            if end_angle < start_angle:
-                end_angle += 360
-            
-            # Малюємо дугу ймовірного відключення (сірим)
-            draw.arc((center - radius + 20, center - radius + 20, center + radius - 20, center + radius - 20),
-                     start=start_angle, end=end_angle, fill=(150, 150, 150), width=40)
-            # Додаємо обведення
-            draw.arc((center - radius + 20, center - radius + 20, center + radius - 20, center + radius - 20),
-                     start=start_angle, end=end_angle, fill=None, outline=(0, 0, 0), width=4)
         except:
             continue
     
@@ -615,9 +453,8 @@ def format_schedule_pretty(subqueue, time_text, date_info):
     msg += f"📅 **{date_info}**\n"
     msg += f"📍 Підчерга: **{subqueue}**\n\n"
     msg += "🕒 **Періоди ВІДКЛЮЧЕНЬ:**\n"
-    for t in clean_display.split("; "):
-        if t.strip():
-            msg += f"• {t.strip()}\n"
+    for t in clean_display.split(", "):
+        msg += f"• {t.strip()}\n"
     msg += "━━━━━━━━━━━━━━━\n"
     msg += "_Оновлено автоматично_ 🔄"
     return msg
@@ -651,18 +488,16 @@ def get_main_menu():
 
 # --- УНІВЕРСАЛЬНА ФУНКЦІЯ ВИДАЧІ ---
 async def send_schedule_logic(chat_id, subqueue, day_type="today", is_update=False):
+    all_data = await parse_hoe_smart()
+    
     target_dt = datetime.now() if day_type == "today" else datetime.now() + timedelta(days=1)
     date_str = target_dt.strftime("%d.%m.%Y")
     
-    # Отримуємо комбінований графік
-    combined = get_combined_schedule(date_str, subqueue, all_data)
-    
-    # Отримуємо дані з сайту для зображення
-    all_data = await parse_hoe_smart()
+    # Спроба знайти дату в ключах (може бути 17.01.26 або 17.01.2026)
     short_date = target_dt.strftime("%d.%m.%y")
     data = all_data.get(date_str) or all_data.get(short_date)
 
-    if not data and combined['source'] == 'none':
+    if not data:
         if day_type == "tomorrow":
             try:
                 await bot.send_message(chat_id, "🕠 <b>Графік на завтра ще не опубліковано.</b>\nЗазвичай він з'являється після <b>20:00</b>.", parse_mode="HTML")
@@ -675,76 +510,52 @@ async def send_schedule_logic(chat_id, subqueue, day_type="today", is_update=Fal
                 logging.error(f"Failed to send message to {chat_id}: {e}")
         return
 
-    img_url = data['img'] if data else None
+    img_url = data['img']
+    schedules = data['list']
     
     if is_update:
         try:
-            if img_url:
-                await bot.send_photo(chat_id, photo=img_url, caption=f"🆕 <b>ОНОВЛЕННЯ НА САЙТІ!</b>\nГрафік на {date_str} вже доступний.", parse_mode="HTML")
-            else:
-                await bot.send_message(chat_id, f"🆕 <b>ОНОВЛЕННЯ НА САЙТІ!</b>\nГрафік на {date_str} вже доступний.", parse_mode="HTML")
-            if not combined['guaranteed'] and not combined['possible']:
+            await bot.send_photo(chat_id, photo=img_url, caption=f"🆕 <b>ОНОВЛЕННЯ НА САЙТІ!</b>\nГрафік на {date_str} вже доступний.", parse_mode="HTML")
+            if not schedules:
                 await bot.send_message(chat_id, "📝 <b>Зверніть увагу:</b> Детальні списки годин відключень будуть розписані трохи пізніше (зазвичай протягом години).", parse_mode="HTML")
         except Exception as e:
             logging.error(f"Failed to send update to {chat_id}: {e}")
         return
 
-    # Формуємо повідомлення
-    if day_type == "today":
-        # Перевіряємо статус світла тільки по гарантованих відключеннях
-        light_now = check_light_status(combined['guaranteed'])
-        status = "🟢 ЗАРАЗ СВІТЛО Є" if light_now else "🔴 ЗАРАЗ СВІТЛА НЕМАЄ"
-        msg = f"<b>{status}</b>\n━━━━━━━━━━━━━━━\n"
+    if not schedules:
+        if day_type == "tomorrow":
+            text = f"📅 <b>Графік на {date_str}</b>\n\n🖼 Детального опису черг ще немає.\n\nПротягом години буде додано детальну інформацію по вашій черзі <b>{subqueue}</b>."
+        else:
+            text = f"📅 <b>Графік на {date_str}</b>\n\n🖼 Детального опису черг ще немає."
+        try:
+            await bot.send_photo(chat_id, photo=img_url, caption=text, parse_mode="HTML")
+        except Exception as e:
+            logging.error(f"Failed to send photo to {chat_id}: {e}")
     else:
-        msg = "━━━━━━━━━━━━━━━\n"
-    
-    msg += f"📅 <b>Графік на {date_str}</b>\n📍 Підчерга: <b>{subqueue}</b>\n\n"
-    
-    # Відключення по порядку
-    all_outages = []
-    
-    # Гарантовані відключення
-    if combined['guaranteed']:
-        for t in combined['guaranteed'].split("; "):
-            if t.strip():
-                all_outages.append(f"• {t.strip()}")
-    
-    # Ймовірні відключення
-    if combined['possible']:
-        for t in combined['possible'].split("; "):
-            if t.strip():
-                all_outages.append(f"• {t.strip()} (можливо)")
-    
-    if all_outages:
+        time_text = schedules.get(subqueue, "")
+        if day_type == "today":
+            light_now = check_light_status(time_text)
+            status = "🟢 ЗАРАЗ СВІТЛО Є" if light_now else "🔴 ЗАРАЗ СВІТЛА НЕМАЄ"
+            msg = f"<b>{status}</b>\n━━━━━━━━━━━━━━━\n"
+        else:
+            msg = "━━━━━━━━━━━━━━━\n"
+        msg += f"📅 <b>{data['raw_date']}</b>\n📍 Підчерга: <b>{subqueue}</b>\n\n"
         msg += f"🕒 <b>ВІДКЛЮЧЕННЯ:</b>\n"
-        msg += "\n".join(all_outages)
-    else:
-        msg += "🕒 <b>ВІДКЛЮЧЕНЬ НЕМАЄ</b>"
-    
-    msg += "\n━━━━━━━━━━━━━━━"
-    
-    # Генеруємо годинник з обома типами відключень
-    clock_file = generate_clock_image(subqueue, combined['guaranteed'], combined['possible'], date_str)
-    
-    try:
-        await bot.send_photo(chat_id, photo=types.FSInputFile(clock_file), caption=msg, parse_mode="HTML")
-    except Exception as e:
-        logging.error(f"Failed to send clock to {chat_id}: {e}")
-        # Fallback до зображення з сайту або просто текст
-        if img_url:
+        for t in time_text.replace("з ", "").replace(" до ", "-").split(", "):
+            msg += f"• {t.strip()}\n"
+        msg += "━━━━━━━━━━━━━━━"
+        
+        # Генеруємо годинник
+        clock_file = generate_clock_image(subqueue, time_text, data['raw_date'])
+        try:
+            await bot.send_photo(chat_id, photo=types.FSInputFile(clock_file), caption=msg, parse_mode="HTML")
+        except Exception as e:
+            logging.error(f"Failed to send clock to {chat_id}: {e}")
+            # Fallback to original
             try:
                 await bot.send_photo(chat_id, photo=img_url, caption=msg, parse_mode="HTML")
             except Exception as e:
                 logging.error(f"Failed to send schedule to {chat_id}: {e}")
-                try:
-                    await bot.send_message(chat_id, msg, parse_mode="HTML")
-                except Exception as e:
-                    logging.error(f"Failed to send message to {chat_id}: {e}")
-        else:
-            try:
-                await bot.send_message(chat_id, msg, parse_mode="HTML")
-            except Exception as e:
-                logging.error(f"Failed to send message to {chat_id}: {e}")
 
 # --- ОБРОБНИКИ ---
 @dp.message(Command("start"))
@@ -963,348 +774,6 @@ async def cmd_stats(message: types.Message):
     
     await message.answer(stats_text, parse_mode="HTML")
 
-@dp.message(Command("manual_schedule"))
-async def cmd_manual_schedule(message: types.Message, state: FSMContext):
-    if message.from_user.id != ADMIN_USER_ID:
-        await message.answer("❌ Доступ заборонено.")
-        return
-    
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Додати графік", callback_data="manual_add")],
-        [InlineKeyboardButton(text="📝 Редагувати графік", callback_data="manual_edit")],
-        [InlineKeyboardButton(text="🗑️ Видалити графік", callback_data="manual_delete")],
-        [InlineKeyboardButton(text="👁️ Переглянути графіки", callback_data="manual_view")]
-    ])
-    
-    await message.answer("🔧 <b>УПРАВЛІННЯ РУЧНИМИ ГРАФІКАМИ</b>\n\nОберіть дію:", reply_markup=kb, parse_mode="HTML")
-
-@dp.callback_query(F.data == "manual_add")
-async def manual_add_start(callback: types.CallbackQuery, state: FSMContext):
-    await callback.message.edit_text("📅 Введіть дату у форматі ДД.ММ.РРРР (наприклад, 15.12.2024):")
-    await state.set_state(ManualScheduleStates.waiting_for_date)
-    await callback.answer()
-
-@dp.callback_query(F.data == "manual_edit")
-async def manual_edit_start(callback: types.CallbackQuery):
-    # Показуємо всі існуючі ручні графіки
-    conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
-    cursor.execute('SELECT date, subqueue, guaranteed_text, possible_text FROM manual_schedules ORDER BY date, subqueue')
-    schedules = cursor.fetchall()
-    conn.close()
-    
-    if not schedules:
-        await callback.message.edit_text("❌ Немає ручних графіків для редагування.")
-        return
-    
-    kb = []
-    for date, subq, guar, poss in schedules:
-        text = f"{date} - {subq}"
-        if guar: text += " (гарантовано)"
-        if poss: text += " (можливо)"
-        kb.append([InlineKeyboardButton(text=text, callback_data=f"edit_sched_{date}_{subq}")])
-    
-    kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="manual_back")])
-    
-    await callback.message.edit_text("📝 Оберіть графік для редагування:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
-    await callback.answer()
-
-@dp.callback_query(F.data == "manual_delete")
-async def manual_delete_start(callback: types.CallbackQuery):
-    # Показуємо всі існуючі ручні графіки
-    conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
-    cursor.execute('SELECT date, subqueue, guaranteed_text, possible_text FROM manual_schedules ORDER BY date, subqueue')
-    schedules = cursor.fetchall()
-    conn.close()
-    
-    if not schedules:
-        await callback.message.edit_text("❌ Немає ручних графіків для видалення.")
-        return
-    
-    kb = []
-    for date, subq, guar, poss in schedules:
-        text = f"{date} - {subq}"
-        if guar: text += " (гарантовано)"
-        if poss: text += " (можливо)"
-        kb.append([InlineKeyboardButton(text=text, callback_data=f"delete_sched_{date}_{subq}")])
-    
-    kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="manual_back")])
-    
-    await callback.message.edit_text("🗑️ Оберіть графік для видалення:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
-    await callback.answer()
-
-@dp.callback_query(F.data == "manual_view")
-async def manual_view(callback: types.CallbackQuery):
-    conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
-    cursor.execute('SELECT date, subqueue, guaranteed_text, possible_text FROM manual_schedules ORDER BY date, subqueue')
-    schedules = cursor.fetchall()
-    conn.close()
-    
-    if not schedules:
-        await callback.message.edit_text("📋 Ручних графіків немає.")
-        return
-    
-    msg = "📋 <b>РУЧНІ ГРАФІКИ:</b>\n\n"
-    for date, subq, guar, poss in schedules:
-        msg += f"📅 <b>{date}</b> - Черга <b>{subq}</b>\n"
-        if guar:
-            msg += f"  🔴 Гарантовано: {guar}\n"
-        if poss:
-            msg += f"  ⚪ Можливо: {poss}\n"
-        msg += "\n"
-    
-    kb = [[InlineKeyboardButton(text="⬅️ Назад", callback_data="manual_back")]]
-    await callback.message.edit_text(msg, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="HTML")
-    await callback.answer()
-
-@dp.callback_query(F.data == "manual_back")
-async def manual_back(callback: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Додати графік", callback_data="manual_add")],
-        [InlineKeyboardButton(text="📝 Редагувати графік", callback_data="manual_edit")],
-        [InlineKeyboardButton(text="🗑️ Видалити графік", callback_data="manual_delete")],
-        [InlineKeyboardButton(text="👁️ Переглянути графіки", callback_data="manual_view")]
-    ])
-    
-    await callback.message.edit_text("🔧 <b>УПРАВЛІННЯ РУЧНИМИ ГРАФІКАМИ</b>\n\nОберіть дію:", reply_markup=kb, parse_mode="HTML")
-    await callback.answer()
-
-# ОБРОБНИКИ СТАНІВ ДЛЯ РУЧНИХ ГРАФІКІВ
-@dp.message(ManualScheduleStates.waiting_for_date)
-async def process_manual_date(message: types.Message, state: FSMContext):
-    date_str = message.text.strip()
-    
-    # Перевіряємо формат дати
-    try:
-        datetime.strptime(date_str, "%d.%m.%Y")
-    except ValueError:
-        await message.answer("❌ Неправильний формат дати. Використовуйте ДД.ММ.РРРР (наприклад, 15.12.2024)")
-        return
-    
-    await state.update_data(date=date_str)
-    await message.answer("📍 Введіть номер черги (наприклад, 1.1, 2.2):")
-    await state.set_state(ManualScheduleStates.waiting_for_subqueue)
-
-@dp.message(ManualScheduleStates.waiting_for_subqueue)
-async def process_manual_subqueue(message: types.Message, state: FSMContext):
-    subqueue = message.text.strip()
-    
-    # Перевіряємо, чи існує така черга
-    valid_subqueues = ["1.1", "1.2", "1.3", "2.1", "2.2", "2.3", "3.1", "3.2", "3.3"]
-    if subqueue not in valid_subqueues:
-        await message.answer(f"❌ Неправильна черга. Допустимі значення: {', '.join(valid_subqueues)}")
-        return
-    
-    await state.update_data(subqueue=subqueue)
-    await message.answer("🔴 Введіть гарантовані відключення у форматі '10:00-12:00; 14:00-16:00' або залиште пустим:")
-    await state.set_state(ManualScheduleStates.waiting_for_guaranteed)
-
-@dp.message(ManualScheduleStates.waiting_for_guaranteed)
-async def process_manual_guaranteed(message: types.Message, state: FSMContext):
-    guaranteed = message.text.strip()
-    await state.update_data(guaranteed=guaranteed)
-    await message.answer("⚪ Введіть ймовірні відключення у форматі '10:00-12:00; 14:00-16:00' або залиште пустим:")
-    await state.set_state(ManualScheduleStates.waiting_for_possible)
-
-@dp.message(ManualScheduleStates.waiting_for_possible)
-async def process_manual_possible(message: types.Message, state: FSMContext):
-    possible = message.text.strip()
-    await state.update_data(possible=possible)
-    
-    data = await state.get_data()
-    
-    # Перевіряємо, чи не порожні обидва поля
-    if not data.get('guaranteed') and not data.get('possible'):
-        await message.answer("❌ Принаймні одне поле (гарантовані або ймовірні відключення) має бути заповнене.")
-        return
-    
-    # Показуємо підтвердження
-    msg = f"📋 <b>ПІДТВЕРДЖЕННЯ ДОДАВАННЯ ГРАФІКА</b>\n\n"
-    msg += f"📅 Дата: <b>{data['date']}</b>\n"
-    msg += f"📍 Черга: <b>{data['subqueue']}</b>\n"
-    if data.get('guaranteed'):
-        msg += f"🔴 Гарантовано: <b>{data['guaranteed']}</b>\n"
-    if data.get('possible'):
-        msg += f"⚪ Можливо: <b>{data['possible']}</b>\n"
-    
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Підтвердити", callback_data="confirm_manual_add")],
-        [InlineKeyboardButton(text="❌ Скасувати", callback_data="cancel_manual")]
-    ])
-    
-    await message.answer(msg, reply_markup=kb, parse_mode="HTML")
-    await state.set_state(ManualScheduleStates.waiting_for_confirm)
-
-@dp.callback_query(F.data == "confirm_manual_add")
-async def confirm_manual_add(callback: types.CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    
-    # Зберігаємо в базу
-    conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
-    cursor.execute('''
-        INSERT OR REPLACE INTO manual_schedules 
-        (date, subqueue, guaranteed_text, possible_text, admin_id, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-    ''', (
-        data['date'], 
-        data['subqueue'], 
-        data.get('guaranteed', ''), 
-        data.get('possible', ''), 
-        callback.from_user.id,
-        datetime.now().isoformat()
-    ))
-    conn.commit()
-    conn.close()
-    
-    await state.clear()
-    await callback.message.edit_text("✅ Ручний графік успішно додано!")
-    await callback.answer()
-
-@dp.callback_query(F.data == "cancel_manual")
-async def cancel_manual(callback: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    await callback.message.edit_text("❌ Додавання графіка скасовано.")
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("edit_sched_"))
-async def edit_schedule(callback: types.CallbackQuery, state: FSMContext):
-    # Розбираємо callback_data: edit_sched_DATE_SUBQUEUE
-    parts = callback.data.split("_", 2)
-    if len(parts) < 3:
-        await callback.answer("❌ Помилка в даних")
-        return
-    
-    date_subq = parts[2]
-    date, subq = date_subq.split("_", 1)
-    
-    # Отримуємо поточні дані
-    conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
-    cursor.execute('SELECT guaranteed_text, possible_text FROM manual_schedules WHERE date = ? AND subqueue = ?', (date, subq))
-    result = cursor.fetchone()
-    conn.close()
-    
-    if not result:
-        await callback.answer("❌ Графік не знайдено")
-        return
-    
-    guar, poss = result
-    
-    await state.update_data(edit_date=date, edit_subqueue=subq, current_guar=guar, current_poss=poss)
-    
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔴 Редагувати гарантовані", callback_data="edit_guar")],
-        [InlineKeyboardButton(text="⚪ Редагувати ймовірні", callback_data="edit_poss")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="manual_edit")]
-    ])
-    
-    msg = f"📝 Редагування графіка {date} - {subq}\n\n"
-    if guar:
-        msg += f"🔴 Гарантовано: {guar}\n"
-    if poss:
-        msg += f"⚪ Можливо: {poss}\n"
-    
-    await callback.message.edit_text(msg, reply_markup=kb)
-    await callback.answer()
-
-@dp.callback_query(F.data == "edit_guar")
-async def edit_guaranteed(callback: types.CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    current = data.get('current_guar', '')
-    await callback.message.edit_text(f"🔴 Поточні гарантовані відключення: {current}\n\nВведіть нові гарантовані відключення:")
-    await state.set_state(ManualScheduleStates.waiting_for_guaranteed)
-    await callback.answer()
-
-@dp.callback_query(F.data == "edit_poss")
-async def edit_possible(callback: types.CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    current = data.get('current_poss', '')
-    await callback.message.edit_text(f"⚪ Поточні ймовірні відключення: {current}\n\nВведіть нові ймовірні відключення:")
-    await state.set_state(ManualScheduleStates.waiting_for_possible)
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("delete_sched_"))
-async def delete_schedule_confirm(callback: types.CallbackQuery):
-    # Розбираємо callback_data: delete_sched_DATE_SUBQUEUE
-    parts = callback.data.split("_", 2)
-    if len(parts) < 3:
-        await callback.answer("❌ Помилка в даних")
-        return
-    
-    date_subq = parts[2]
-    date, subq = date_subq.split("_", 1)
-    
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🗑️ Видалити", callback_data=f"confirm_delete_{date}_{subq}")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="manual_delete")]
-    ])
-    
-    await callback.message.edit_text(f"🗑️ Видалити графік {date} - {subq}?", reply_markup=kb)
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("confirm_delete_"))
-async def confirm_delete(callback: types.CallbackQuery):
-    # Розбираємо callback_data: confirm_delete_DATE_SUBQUEUE
-    parts = callback.data.split("_", 2)
-    if len(parts) < 3:
-        await callback.answer("❌ Помилка в даних")
-        return
-    
-    date_subq = parts[2]
-    date, subq = date_subq.split("_", 1)
-    
-    # Видаляємо з бази
-    conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
-    cursor.execute('DELETE FROM manual_schedules WHERE date = ? AND subqueue = ?', (date, subq))
-    conn.commit()
-    conn.close()
-    
-    await callback.message.edit_text(f"✅ Графік {date} - {subq} видалено!")
-    await callback.answer()
-
-# ОБРОБНИКИ РЕДАГУВАННЯ ГРАФІКІВ
-@dp.message(ManualScheduleStates.waiting_for_guaranteed, F.data == "edit_guar")
-async def process_edit_guaranteed(message: types.Message, state: FSMContext):
-    data = await state.get_data()
-    guaranteed = message.text.strip()
-    
-    # Оновлюємо в базі
-    conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
-    cursor.execute('''
-        UPDATE manual_schedules 
-        SET guaranteed_text = ?, updated_at = ?
-        WHERE date = ? AND subqueue = ?
-    ''', (guaranteed, datetime.now().isoformat(), data['edit_date'], data['edit_subqueue']))
-    conn.commit()
-    conn.close()
-    
-    await state.clear()
-    await message.answer("✅ Гарантовані відключення оновлено!")
-
-@dp.message(ManualScheduleStates.waiting_for_possible, F.data == "edit_poss")
-async def process_edit_possible(message: types.Message, state: FSMContext):
-    data = await state.get_data()
-    possible = message.text.strip()
-    
-    # Оновлюємо в базі
-    conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
-    cursor.execute('''
-        UPDATE manual_schedules 
-        SET possible_text = ?, updated_at = ?
-        WHERE date = ? AND subqueue = ?
-    ''', (possible, datetime.now().isoformat(), data['edit_date'], data['edit_subqueue']))
-    conn.commit()
-    conn.close()
-    
-    await state.clear()
-    await message.answer("✅ Ймовірні відключення оновлено!")
 
 
 #ОБРОБНИКИ АДРЕС
@@ -1601,20 +1070,6 @@ async def process_edit_addr_name(message: types.Message, state: FSMContext):
 
 
 # --- МОНІТОРИНГ ТА СПОВІЩЕННЯ ---
-
-def normalize_schedule_text(text):
-    """Normalize schedule text for comparison: strip, replace 'до' with '-', normalize separators."""
-    if not text:
-        return ""
-    text = text.strip()
-    text = re.sub(r'\s+', ' ', text)  # multiple spaces to single
-    text = re.sub(r'[–\-\—\−]', '-', text)  # normalize dashes
-    text = re.sub(r',\s*з\s+', '; ', text)  # ', з ' to '; '  -- first!
-    text = re.sub(r'з\s+', '', text)  # remove 'з '
-    text = re.sub(r'\s+до\s+', '-', text)  # ' до ' to '-'
-    text = re.sub(r';\s*$', '', text)  # remove trailing ;
-    return text
-
 async def monitor_job():
     try:
         all_data = await parse_hoe_smart()
@@ -1645,33 +1100,42 @@ async def monitor_job():
         
         for date_key, data in all_data.items():
             try:
-                # Skip past dates - don't send notifications for schedules that have already passed
-                try:
-                    date_dt = datetime.strptime(date_key, "%d.%m.%Y")
-                except ValueError:
-                    try:
-                        date_dt = datetime.strptime(date_key, "%d.%m.%y")
-                        date_dt = date_dt.replace(year=2000 + date_dt.year % 100)
-                    except ValueError:
-                        continue
-                
-                if date_dt.date() < now.date():
-                    logging.info(f"Skipping past date {date_key}")
-                    continue
-                
                 is_new = date_key not in known_schedules
                 has_list_now = bool(data['list'])
                 had_list = known_schedules.get(date_key, {}).get('has_list', False)
-                old_list_raw = known_schedules.get(date_key, {}).get('list', {})
-                old_list = {k: normalize_schedule_text(v) for k, v in old_list_raw.items()}
-                new_list = {k: normalize_schedule_text(v) for k, v in data['list'].items()}
-                list_changed = old_list != new_list
+                list_changed = known_schedules.get(date_key, {}).get('list', {}) != data['list']
                 img_changed = known_schedules.get(date_key, {}).get('img', '') != data['img']
                 
-                logging.info(f"Checking {date_key}: is_new={is_new}, list_changed={list_changed}, img_changed={img_changed}, has_list_now={has_list_now}, had_list={had_list}")
-                
-                if is_new or img_changed or list_changed or (not had_list and has_list_now):
+                if is_new or img_changed or (not had_list and has_list_now):
                     logging.info(f"Detected change for {date_key}: is_new={is_new}, list_changed={list_changed}, img_changed={img_changed}, has_list_now={has_list_now}, had_list={had_list}")
+                    
+                    old_list = known_schedules.get(date_key, {}).get('list', {})
+                    new_list = data['list']
+                    
+                    # Determine affected subqueues
+                    if is_new:
+                        # New schedule - affects all subqueues
+                        affected_subqueues = set(new_list.keys())
+                        change_type = "new_schedule"
+                    elif not had_list and has_list_now:
+                        # Lists just appeared - affects all subqueues
+                        affected_subqueues = set(new_list.keys())
+                        change_type = "lists_added"
+                    elif list_changed:
+                        # Existing schedule changed - find which subqueues changed
+                        affected_subqueues = set()
+                        for sq in set(old_list.keys()) | set(new_list.keys()):
+                            old_schedule = old_list.get(sq, "")
+                            new_schedule = new_list.get(sq, "")
+                            if old_schedule != new_schedule:
+                                affected_subqueues.add(sq)
+                        change_type = "schedule_updated"
+                    else:
+                        # img_changed
+                        affected_subqueues = set(new_list.keys())
+                        change_type = "img_updated"
+                    
+                    logging.info(f"Affected subqueues for {date_key}: {affected_subqueues}, change_type: {change_type}")
                     
                     # This is new or updated
                     updated_dates.append(date_key)
@@ -1690,61 +1154,68 @@ async def monitor_job():
                     
                     if days_diff == 0:
                         msg_type = "update_today"
-                        change_type = "img_updated" if not is_new else "new_schedule"
                     elif days_diff == 1:
                         msg_type = "new_tomorrow" if is_new else "update_tomorrow"
-                        change_type = "new_schedule" if is_new else "img_updated"
                     else:
                         msg_type = "new_future" if is_new else "update_future"
-                        change_type = "new_schedule" if is_new else "img_updated"
                     
-                    # Send notifications to all users (since schedules are in images, we can't filter by subqueue)
-                    user_ids = set()
+                    # Send notifications
+                    user_notifications = {}  # uid -> list of (addr_name, subq, msg_type)
                     for uid, addr_name, subq in all_user_addresses:
-                        user_ids.add(uid)
+                        if subq not in affected_subqueues:
+                            continue  # Надсилаємо тільки якщо черга користувача була змінена
+                        
+                        # Перевіряємо налаштування
+                        general_settings = get_user_notification_settings(uid)
+                        addr_settings = get_user_notification_settings(uid, addr_name)
+                        
+                        send_new = addr_settings['new_schedule_enabled'] and general_settings['new_schedule_enabled']
+                        send_changes = addr_settings['schedule_changes_enabled'] and general_settings['schedule_changes_enabled']
+                        
+                        should_send = False
+                        if msg_type in ["new_tomorrow", "new_future"] and send_new:
+                            should_send = True
+                        elif msg_type in ["update_today", "update_tomorrow"] and send_changes:
+                            should_send = True
+                        
+                        if should_send:
+                            if uid not in user_notifications:
+                                user_notifications[uid] = []
+                            user_notifications[uid].append((addr_name, subq, msg_type))
                     
-                    for uid in user_ids:
+                    # Надсилаємо груповані сповіщення
+                    for uid, notifications in user_notifications.items():
                         try:
-                            # Check user notification settings
-                            general_settings = get_user_notification_settings(uid)
-                            if not general_settings['notifications_enabled']:
-                                continue
-                            
-                            if msg_type in ["new_tomorrow", "new_future"]:
-                                if general_settings['new_schedule_enabled']:
-                                    caption = f"🆕 <b>НОВИЙ ГРАФІК!</b>\n\nГрафік на {date_key} вже доступний на сайті."
+                            if len(notifications) == 1:
+                                addr_name, subq, msg_type = notifications[0]
+                                if msg_type in ["new_tomorrow", "new_future"]:
+                                    caption = f"🆕 <b>НОВИЙ ГРАФІК!</b>\n\nГрафік на {date_key} вже доступний на сайті для адреси <b>{addr_name}</b> (черга {subq})."
                                     await bot.send_photo(uid, photo=data['img'], caption=caption, parse_mode="HTML")
                                     if not has_list_now:
                                         await bot.send_message(uid, "📝 <b>Зверніть увагу:</b> Детальні списки годин відключень будуть розписані трохи пізніше (зазвичай протягом години).", parse_mode="HTML")
-                            elif msg_type == "update_today":
-                                if general_settings['schedule_changes_enabled']:
-                                    if list_changed and old_list and new_list:
-                                        # Show what changed in schedules
-                                        changed_subqueues = []
-                                        for sq in set(old_list.keys()) | set(new_list.keys()):
-                                            old_sched = old_list.get(sq, "")
-                                            new_sched = new_list.get(sq, "")
-                                            if old_sched != new_sched:
-                                                changed_subqueues.append(f"{sq}: {old_sched} → {new_sched}")
-                                        
-                                        if changed_subqueues:
-                                            caption = f"🔄 <b>ЗМІНИ В ГРАФІКУ!</b>\n\nГрафік на {date_key} було оновлено:\n" + "\n".join(changed_subqueues[:3])  # Limit to 3 changes
-                                            await bot.send_photo(uid, photo=data['img'], caption=caption, parse_mode="HTML")
-                                        else:
-                                            caption = f"🔄 <b>ОНОВЛЕННЯ ГРАФІКА!</b>\n\nГрафік на {date_key} було оновлено."
-                                            await bot.send_photo(uid, photo=data['img'], caption=caption, parse_mode="HTML")
-                                    elif not had_list and has_list_now:
-                                        # Lists appeared
-                                        caption = f"📝 <b>ОНОВЛЕННЯ ГРАФІКА!</b>\n\nДетальні списки годин відключень на {date_key} тепер доступні."
-                                        await bot.send_photo(uid, photo=data['img'], caption=caption, parse_mode="HTML")
-                                    else:
-                                        # General update
-                                        caption = f"🔄 <b>ОНОВЛЕННЯ ГРАФІКА!</b>\n\nГрафік на {date_key} було оновлено."
-                                        await bot.send_photo(uid, photo=data['img'], caption=caption, parse_mode="HTML")
-                            elif msg_type == "update_tomorrow":
-                                if general_settings['schedule_changes_enabled']:
+                                elif msg_type == "update_today":
+                                    await send_schedule_logic(uid, subq, "today", is_update=True)
+                                elif msg_type == "update_tomorrow":
                                     if has_list_now and not had_list:
-                                        caption = f"📝 <b>ОНОВЛЕННЯ ГРАФІКА!</b>\n\nДетальні списки годин відключень на {date_key} тепер доступні."
+                                        caption = f"📝 <b>ОНОВЛЕННЯ ГРАФІКА!</b>\n\nДетальні списки годин відключень на {date_key} тепер доступні для адреси <b>{addr_name}</b> (черга {subq})."
+                                        await bot.send_photo(uid, photo=data['img'], caption=caption, parse_mode="HTML")
+                            else:
+                                # Групуємо повідомлення
+                                addr_list = [f"<b>{name}</b> (черга {subq})" for name, subq, _ in notifications]
+                                addr_text = ", ".join(addr_list)
+                                if msg_type in ["new_tomorrow", "new_future"]:
+                                    caption = f"🆕 <b>НОВИЙ ГРАФІК!</b>\n\nГрафік на {date_key} вже доступний на сайті для ваших адрес: {addr_text}."
+                                    await bot.send_photo(uid, photo=data['img'], caption=caption, parse_mode="HTML")
+                                    if not has_list_now:
+                                        await bot.send_message(uid, "📝 <b>Зверніть увагу:</b> Детальні списки годин відключень будуть розписані трохи пізніше (зазвичай протягом години).", parse_mode="HTML")
+                                elif msg_type == "update_today":
+                                    # Для оновлень сьогодні надсилаємо для основної адреси або першої
+                                    main_addr = next((name for name, _, is_main in get_user_addresses(uid) if is_main), notifications[0][0])
+                                    main_subq = next(subq for name, subq, _ in notifications if name == main_addr)
+                                    await send_schedule_logic(uid, main_subq, "today", is_update=True)
+                                elif msg_type == "update_tomorrow":
+                                    if has_list_now and not had_list:
+                                        caption = f"📝 <b>ОНОВЛЕННЯ ГРАФІКА!</b>\n\nДетальні списки годин відключень на {date_key} тепер доступні для ваших адрес: {addr_text}."
                                         await bot.send_photo(uid, photo=data['img'], caption=caption, parse_mode="HTML")
                         except Exception as e:
                             logging.error(f"Failed to send notification to {uid}: {e}")
@@ -1754,18 +1225,8 @@ async def monitor_job():
                     known_schedules[date_key] = {
                         'img': data['img'],
                         'list': data['list'],
-                        'has_list': has_list_now,
-                        'raw_date': data['raw_date']
+                        'has_list': has_list_now
                     }
-                else:
-                    # No change, but ensure it's stored
-                    if date_key not in known_schedules:
-                        known_schedules[date_key] = {
-                            'img': data['img'],
-                            'list': data['list'],
-                            'has_list': has_list_now,
-                            'raw_date': data['raw_date']
-                        }
             except Exception as e:
                 logging.error(f"Error processing date {date_key}: {e}")
                 continue
@@ -1862,11 +1323,11 @@ async def monitor_job():
                                 if not enabled_addrs:
                                     continue
                                 
-                                # Перевіряємо, чи вже надсилали - REMOVED HERE, moved to after grouping
-                                # cursor.execute('SELECT 1 FROM sent_alerts WHERE user_id=? AND event_time=? AND event_date=?', 
-                                #                (uid, change_time_str, event_date))
-                                # if cursor.fetchone():
-                                #     continue
+                                # Перевіряємо, чи вже надсилали
+                                cursor.execute('SELECT 1 FROM sent_alerts WHERE user_id=? AND event_time=? AND event_date=?', 
+                                               (uid, change_time_str, event_date))
+                                if cursor.fetchone():
+                                    continue
                                 
                                 if uid not in user_alerts:
                                     user_alerts[uid] = []
@@ -1898,12 +1359,6 @@ async def monitor_job():
                             addr_text = ", ".join(addr_list)
                             alert_msg = f"{alert_base} для ваших адрес: <b>{addr_text}</b>."
                         
-                        # Перевіряємо, чи вже надсилали для цього часу
-                        cursor.execute('SELECT 1 FROM sent_alerts WHERE user_id=? AND event_time=? AND event_date=?', 
-                                       (uid, change_time_str, event_date))
-                        if cursor.fetchone():
-                            continue  # Вже надсилали сповіщення для цього часу
-                        
                         try:
                             await bot.send_message(uid, alert_msg, parse_mode="HTML")
                             cursor.execute('INSERT INTO sent_alerts VALUES (?, ?, ?)', (uid, change_time_str, event_date))
@@ -1932,8 +1387,6 @@ async def monitor_job():
         conn.close()
     except Exception as e:
         logging.error(f"Error in monitor_job: {e}")
-
-@dp.message(BroadcastStates.waiting_for_message)
 async def process_broadcast_message(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_USER_ID:  # Додаткова перевірка
         await message.answer("❌ Доступ заборонено.")

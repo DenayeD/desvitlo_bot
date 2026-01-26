@@ -20,6 +20,9 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from PIL import Image, ImageDraw, ImageFont
 import math
 from dotenv import load_dotenv
+import cv2
+import numpy as np
+import pytesseract
 
 # Завантажуємо змінні середовища
 load_dotenv()
@@ -362,14 +365,30 @@ def delete_manual_schedule(date, subqueue):
 
 def get_combined_schedule(date, subqueue, site_data=None):
     """Отримує комбінований графік: гарантовані з сайту + ймовірні з ручних"""
-    # Отримуємо дані з сайту (синхронно, використовуючи глобальні дані або кеш)
-    # Поки що повертаємо тільки ручні дані, пізніше додамо інтеграцію з сайтом
+    guaranteed = ''
+    possible = ''
+
+    # Отримуємо дані з сайту
+    if site_data and date in site_data:
+        schedule_text = site_data[date]['list'].get(subqueue, '')
+        # Розділяємо на guaranteed і possible
+        if "Вимкнено:" in schedule_text:
+            guaranteed = schedule_text.split("Вимкнено:")[1].split(";")[0].strip()
+        if "Можливо вимкнено:" in schedule_text:
+            possible = schedule_text.split("Можливо вимкнено:")[1].strip()
+
+    # Додаємо ручні дані
     manual = get_manual_schedule(date, subqueue)
-    
+    if manual:
+        if manual['guaranteed_text']:
+            guaranteed = manual['guaranteed_text'] if not guaranteed else f"{guaranteed}; {manual['guaranteed_text']}"
+        if manual['possible_text']:
+            possible = manual['possible_text'] if not possible else f"{possible}; {manual['possible_text']}"
+
     return {
-        'guaranteed': '',
-        'possible': manual['possible_text'] if manual else '',
-        'source': 'manual' if manual else 'none'
+        'guaranteed': guaranteed,
+        'possible': possible,
+        'source': 'site' if site_data and date in site_data else 'manual'
     }
 
 # --- ЛОГІКА ТА ПАРСИНГ ---
@@ -456,7 +475,12 @@ async def parse_hoe_smart():
                             if match:
                                 subq, schedule = match.groups()
                                 schedules[subq] = normalize_schedule_text(schedule)
-
+                    
+                    # Якщо немає текстового опису, пробуємо OCR парсинг зображення
+                    if not schedules:
+                        logging.info(f"Немає текстового опису для {date_key}, використовуємо OCR парсинг")
+                        schedules = await parse_schedule_image(img_url)
+                    
                     # Якщо для цієї дати вже є запис, порівнюємо за timestamp (свіжіший виграє)
                     if date_key not in data_by_date or timestamp > data_by_date[date_key].get('timestamp', 0):
                         data_by_date[date_key] = {
@@ -471,7 +495,278 @@ async def parse_hoe_smart():
             logging.error(f"Парсинг error: {e}")
             return {}
 
-def generate_clock_image(subqueue, guaranteed_text, possible_text="", date_info=""):
+async def parse_schedule_image(image_path_or_url):
+    """
+    Парсинг графіку з зображення.
+    Повертає словник {subqueue: schedule_text}
+    """
+    try:
+        # Завантажуємо зображення
+        if image_path_or_url.startswith('http'):
+            async with aiohttp.ClientSession() as session:
+                async with session.get(image_path_or_url) as response:
+                    image_data = await response.read()
+                    nparr = np.frombuffer(image_data, np.uint8)
+                    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        else:
+            img = cv2.imread(image_path_or_url)
+        
+        if img is None:
+            logging.error(f"Не вдалося завантажити зображення: {image_path_or_url}")
+            return {}
+        
+        # Конвертуємо в RGB для PIL
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(img_rgb)
+        
+        # OCR для розпізнавання тексту (якщо потрібно для заголовків)
+        # pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'  # налаштувати шлях
+        
+        # Основна логіка парсингу кольорів
+        schedules = parse_table_colors(img)
+        
+        return schedules
+        
+    except Exception as e:
+        logging.error(f"OCR парсинг error: {e}")
+        return {}
+
+def parse_table_colors(img):
+    """
+    Аналіз кольорів таблиці графіку.
+    Повертає словник з розкладом для кожної черги.
+    """
+    # Конвертуємо в HSV для кращого аналізу кольорів
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    
+    # Визначаємо діапазони кольорів на основі аналізу test_schedule.png
+    # Синій/бірюзовий (немає світла) - RGB [143,170,220], HSV [109,89,220]
+    blue_lower = np.array([100, 50, 100])
+    blue_upper = np.array([120, 255, 255])
+    
+    # Сірий (можливо вимкнуть) - RGB [224,224,224], HSV [0,0,224]
+    gray_lower = np.array([0, 0, 200])
+    gray_upper = np.array([180, 30, 250])
+    
+    # Білий (буде світло) - RGB [255,255,255], HSV [0,0,255]
+    white_lower = np.array([0, 0, 250])
+    white_upper = np.array([180, 20, 255])
+    
+    height, width = img.shape[:2]
+    
+    # Завантажуємо налаштування таблиці
+    try:
+        with open('table_bounds.json', 'r') as f:
+            settings = json.load(f)
+        table_left = settings.get('table_left', int(width * 0.05))
+        table_right = settings.get('table_right', int(width * 0.95))
+        table_top = settings.get('table_top', int(height * 0.15))
+        table_bottom = settings.get('table_bottom', int(height * 0.95))
+        cell_width = settings.get('cell_width', (table_right - table_left) // 24)
+        cell_height = settings.get('cell_height', (table_bottom - table_top) // 12)
+        rows = settings.get('rows', 12)  # черги по вертикалі
+        cols = settings.get('cols', 24)  # години по горизонталі
+    except:
+        # Налаштування за замовчуванням
+        rows = 12  # черги
+        cols = 24  # години
+        table_top = int(height * 0.15)
+        table_bottom = int(height * 0.95)
+        table_left = int(width * 0.05)
+        table_right = int(width * 0.95)
+        cell_height = (table_bottom - table_top) // rows
+        cell_width = (table_right - table_left) // cols
+    
+    schedules = {}
+    
+    for row in range(rows):
+        subqueue = f"{row//2 + 1}.{row%2 + 1}"  # 1.1, 1.2, 2.1, 2.2, ...
+        intervals_off = []  # гарантовані відключення
+        intervals_possible = []  # можливі відключення
+        
+        for col in range(cols):
+            x1 = table_left + col * cell_width
+            y1 = table_top + row * cell_height
+            x2 = x1 + cell_width
+            y2 = y1 + cell_height
+            
+            # Беремо центральну частину клітинки
+            margin = 3
+            cell_roi = img[y1+margin:y2-margin, x1+margin:x2-margin]
+            if cell_roi.size == 0:
+                continue
+                
+            # Конвертуємо в HSV
+            hsv_cell = cv2.cvtColor(cell_roi, cv2.COLOR_BGR2HSV)
+            
+            # Рахуємо пікселі кожного кольору
+            blue_pixels = cv2.countNonZero(cv2.inRange(hsv_cell, blue_lower, blue_upper))
+            gray_pixels = cv2.countNonZero(cv2.inRange(hsv_cell, gray_lower, gray_upper))
+            white_pixels = cv2.countNonZero(cv2.inRange(hsv_cell, white_lower, white_upper))
+            
+            total_pixels = cell_roi.size // 3
+            
+            # Визначаємо домінуючий колір
+            max_pixels = max(blue_pixels, gray_pixels, white_pixels)
+            
+            if max_pixels / total_pixels > 0.3:  # більше 30% пікселів цього кольору
+                if blue_pixels == max_pixels:
+                    status = "off"  # немає світла
+                elif gray_pixels == max_pixels:
+                    status = "possible"  # можливо
+                else:
+                    status = "on"  # буде світло
+            else:
+                status = "on"  # за замовчуванням
+            
+            # Додаємо інтервали
+            if status == "off":
+                start_hour = col
+                end_hour = col + 1
+                intervals_off.append(f"{start_hour:02d}:00-{end_hour:02d}:00")
+            elif status == "possible":
+                start_hour = col
+                end_hour = col + 1
+                intervals_possible.append(f"{start_hour:02d}:00-{end_hour:02d}:00")
+        
+        # Формуємо текст розкладу
+        schedule_parts = []
+        if intervals_off:
+            schedule_parts.append("Вимкнено: " + ", ".join(intervals_off))
+        if intervals_possible:
+            schedule_parts.append("Можливо вимкнено: " + ", ".join(intervals_possible))
+        
+        if schedule_parts:
+            schedules[subqueue] = "; ".join(schedule_parts)
+    
+    return schedules
+
+# --- СИСТЕМА КЕШУВАННЯ РОЗПАРСЕНИХ ГРАФІКІВ ---
+
+def load_cached_schedules():
+    """Завантажує кешовані розклади з файлу"""
+    try:
+        with open('cached_schedules.json', 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except:
+        return {}
+
+def save_cached_schedules(cached_schedules):
+    """Зберігає кешовані розклади у файл"""
+    try:
+        with open('cached_schedules.json', 'w', encoding='utf-8') as f:
+            json.dump(cached_schedules, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logging.error(f"Error saving cached schedules: {e}")
+
+def get_schedule_for_date(date_key, subqueue):
+    """Отримує розклад для конкретної дати та черги з кешу"""
+    cached = load_cached_schedules()
+    date_data = cached.get(date_key, {})
+    return date_data.get(subqueue, "")
+
+def update_cached_schedule(date_key, subqueue, schedule_text, schedule_type="full"):
+    """
+    Оновлює кешований розклад
+    schedule_type: "full" - повний розклад, "changes" - тільки зміни
+    """
+    cached = load_cached_schedules()
+    
+    if date_key not in cached:
+        cached[date_key] = {}
+    
+    if schedule_type == "full":
+        # Повне оновлення розкладу
+        cached[date_key][subqueue] = schedule_text
+    elif schedule_type == "changes":
+        # Доповнення існуючого розкладу змінами
+        existing = cached[date_key].get(subqueue, "")
+        if existing and schedule_text:
+            # Логіка злиття розкладів (спростимо поки що)
+            cached[date_key][subqueue] = existing + "; " + schedule_text
+        else:
+            cached[date_key][subqueue] = schedule_text
+    
+    save_cached_schedules(cached)
+    logging.info(f"Updated cached schedule for {date_key}, {subqueue}")
+
+def parse_schedule_to_intervals(schedule_text):
+    """
+    Парсить текст розкладу в інтервали для годинника
+    Повертає словник з guaranteed та possible інтервалами
+    """
+    intervals = {
+        'guaranteed': [],  # [(start_hour, end_hour), ...]
+        'possible': []     # [(start_hour, end_hour), ...]
+    }
+    
+    if not schedule_text:
+        return intervals
+    
+    # Розділяємо на частини по ";"
+    parts = schedule_text.split(';')
+    
+    # Якщо є тільки одна частина - це гарантовані відключення
+    if len(parts) == 1:
+        text = parts[0].strip()
+        if text:
+            intervals['guaranteed'].extend(parse_intervals_text(text))
+    else:
+        # Перша частина - гарантовані, друга - можливі
+        guaranteed_text = parts[0].strip()
+        possible_text = parts[1].strip()
+        
+        if guaranteed_text:
+            intervals['guaranteed'].extend(parse_intervals_text(guaranteed_text))
+        if possible_text:
+            intervals['possible'].extend(parse_intervals_text(possible_text))
+    
+    return intervals
+
+def parse_intervals_text(text):
+    """Парсить текст інтервалів типу '01:00-02:00, 03:00-04:00'"""
+    intervals = []
+    if not text:
+        return intervals
+    
+    # Розділяємо по комах
+    time_ranges = text.split(',')
+    for time_range in time_ranges:
+        time_range = time_range.strip()
+        match = re.search(r'(\d{1,2}):00-(\d{1,2}):00', time_range)
+        if match:
+            start_hour = int(match.group(1))
+            end_hour = int(match.group(2))
+            intervals.append((start_hour, end_hour))
+    
+    return intervals
+
+def merge_consecutive_intervals(intervals):
+    """Об'єднує інтервали, які йдуть підряд"""
+    if not intervals:
+        return intervals
+    
+    # Сортуємо інтервали за початковим часом
+    sorted_intervals = sorted(intervals, key=lambda x: x[0])
+    merged = [sorted_intervals[0]]
+    
+    for start, end in sorted_intervals[1:]:
+        last_start, last_end = merged[-1]
+        # Якщо поточний інтервал починається відразу після попереднього
+        if start == last_end:
+            # Об'єднуємо інтервали
+            merged[-1] = (last_start, end)
+        else:
+            # Додаємо новий інтервал
+            merged.append((start, end))
+    
+    return merged
+
+def generate_clock_image(subqueue, schedule_text, date_info=""):
+    """
+    Створює зображення годинника з відключеннями
+    schedule_text: об'єднаний текст розкладу типу "Вимкнено: 01:00-02:00; Можливо вимкнено: 03:00-04:00"
+    """
     # Створюємо зображення годинника
     os.makedirs('clocks', exist_ok=True)
     filename = f"clocks/{subqueue}_{date_info.replace('.', '_')}.png"
@@ -501,20 +796,16 @@ def generate_clock_image(subqueue, guaranteed_text, possible_text="", date_info=
     draw.ellipse((center - radius, center - radius, center + radius, center + radius), 
                  outline=(100, 100, 100), width=3)
     
-    # Спроба завантажити шрифт (для Linux сервера)
+    # Спроба завантажити шрифт
     try:
-        # Спробуємо arial.ttf в поточній папці (якщо завантажено)
-        font = ImageFont.truetype('arial.ttf', 32)  # Збільшено до 36
+        font = ImageFont.truetype('arial.ttf', 32)
     except:
         try:
-            # Системний шрифт для Linux
             font = ImageFont.truetype('/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf', 32)
         except:
             try:
-                # Альтернативний системний шрифт
                 font = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', 32)
             except:
-                # Якщо нічого не працює, використовуємо default
                 font = ImageFont.load_default()
     
     # Засічки годин
@@ -533,7 +824,6 @@ def generate_clock_image(subqueue, guaranteed_text, possible_text="", date_info=
             text_r = radius + 15  # За межами кола годинника
             x = center + text_r * math.cos(angle)
             y = center + text_r * math.sin(angle)
-            # Розмір тексту для центрування
             bbox = draw.textbbox((0, 0), str(hour), font=font)
             text_width = bbox[2] - bbox[0]
             text_height = bbox[3] - bbox[1]
@@ -547,17 +837,14 @@ def generate_clock_image(subqueue, guaranteed_text, possible_text="", date_info=
             # Основний текст білим
             draw.text((cx, cy), str(hour), fill=(255, 255, 255), font=font)
     
-    # Парсимо інтервали відключень
-    # Гарантовані відключення - червоним
-    guaranteed_intervals = re.findall(r"(\d{2}:\d{2})[–\-\—\−](\d{2}:\d{2})", guaranteed_text.replace("з ", "").replace(" до ", "-"))
+    # Парсимо інтервали відключень з об'єднаного тексту
+    intervals = parse_schedule_to_intervals(schedule_text)
     
-    for start_str, end_str in guaranteed_intervals:
+    # Гарантовані відключення - червоним
+    for start_hour, end_hour in intervals['guaranteed']:
         try:
-            start_h, start_m = map(int, start_str.split(':'))
-            end_h, end_m = map(int, end_str.split(':'))
-            
-            start_angle = (start_h * 15 + start_m * 0.25) - 90
-            end_angle = (end_h * 15 + end_m * 0.25) - 90
+            start_angle = (start_hour * 15) - 90
+            end_angle = (end_hour * 15) - 90
             
             if end_angle < start_angle:
                 end_angle += 360
@@ -571,53 +858,56 @@ def generate_clock_image(subqueue, guaranteed_text, possible_text="", date_info=
         except:
             continue
     
-    # Ймовірні відключення - сірим
-    possible_intervals = re.findall(r"(\d{2}:\d{2})[–\-\—\−](\d{2}:\d{2})", possible_text.replace("з ", "").replace(" до ", "-"))
-    
-    for start_str, end_str in possible_intervals:
+    # Можливі відключення - сірим
+    for start_hour, end_hour in intervals['possible']:
         try:
-            start_h, start_m = map(int, start_str.split(':'))
-            end_h, end_m = map(int, end_str.split(':'))
-            
-            start_angle = (start_h * 15 + start_m * 0.25) - 90
-            end_angle = (end_h * 15 + end_m * 0.25) - 90
+            start_angle = (start_hour * 15) - 90
+            end_angle = (end_hour * 15) - 90
             
             if end_angle < start_angle:
                 end_angle += 360
             
-            # Малюємо дугу ймовірного відключення (сірим)
-            draw.arc((center - radius + 20, center - radius + 20, center + radius - 20, center + radius - 20),
-                     start=start_angle, end=end_angle, fill=(150, 150, 150), width=40)
+            # Малюємо дугу можливого відключення (сірим)
+            draw.arc((center - radius + 60, center - radius + 60, center + radius - 60, center + radius - 60),
+                     start=start_angle, end=end_angle, fill=(150, 150, 150), width=20)
             # Додаємо обведення
-            draw.arc((center - radius + 20, center - radius + 20, center + radius - 20, center + radius - 20),
-                     start=start_angle, end=end_angle, fill=None, outline=(0, 0, 0), width=4)
+            draw.arc((center - radius + 60, center - radius + 60, center + radius - 60, center + radius - 60),
+                     start=start_angle, end=end_angle, fill=None, outline=(0, 0, 0), width=2)
         except:
             continue
-    
-    # Стрілка поточного часу прибрана
-    
-    # Текст інформації в верхньому лівому куті
-    text = f"{date_info}\nЧерга {subqueue}"
-    draw.text((10, 10), text, fill=(0, 0, 0), font=font)
     
     # Зберігаємо зображення
     img.save(filename)
     return filename
 
-def format_schedule_pretty(subqueue, time_text, date_info):
-    light_now = check_light_status(time_text)
+def format_schedule_pretty(subqueue, guaranteed_text, possible_text, date_info):
+    # Перевіряємо статус світла (гарантовані відключення)
+    light_now = check_light_status(guaranteed_text)
     status_emoji = "🟢" if light_now else "🔴"
     status_text = "СВІТЛО Є" if light_now else "СВІТЛА НЕМАЄ"
-    clean_display = re.sub(r"[–\—\−]", "-", time_text.replace("з ", "").replace(" до ", "-"))
-    
+
     msg = f"{status_emoji} **ЗАРАЗ {status_text}**\n"
     msg += "━━━━━━━━━━━━━━━\n"
     msg += f"📅 **{date_info}**\n"
     msg += f"📍 Підчерга: **{subqueue}**\n\n"
-    msg += "🕒 **Періоди ВІДКЛЮЧЕНЬ:**\n"
-    for t in clean_display.split("; "):
-        if t.strip():
-            msg += f"• {t.strip()}\n"
+
+    if guaranteed_text.strip():
+        msg += "🔴 **ГАРАНТОВАНІ ВІДКЛЮЧЕННЯ:**\n"
+        clean_display = re.sub(r"[–\—\−]", "-", guaranteed_text.replace("з ", "").replace(" до ", "-"))
+        for t in clean_display.split("; "):
+            if t.strip():
+                msg += f"• {t.strip()}\n"
+
+    if possible_text.strip():
+        msg += "\n🟡 **МОЖЛИВІ ВІДКЛЮЧЕННЯ:**\n"
+        clean_display = re.sub(r"[–\—\−]", "-", possible_text.replace("з ", "").replace(" до ", "-"))
+        for t in clean_display.split("; "):
+            if t.strip():
+                msg += f"• {t.strip()}\n"
+
+    if not guaranteed_text.strip() and not possible_text.strip():
+        msg += "✅ **ЦІЛОДОБОВО СВІТЛО**\n"
+
     msg += "━━━━━━━━━━━━━━━\n"
     msg += "_Оновлено автоматично_ 🔄"
     return msg
@@ -649,20 +939,109 @@ def get_main_menu():
     ]
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
+def format_outages_compact(intervals):
+    """
+    Форматує відключення в компактному вигляді з об'єднанням інтервалів
+    Повертає список рядків для відображення
+    """
+    # Об'єднуємо гарантовані інтервали
+    guaranteed = merge_consecutive_intervals(intervals['guaranteed'])
+    possible = merge_consecutive_intervals(intervals['possible'])
+    
+    # Створюємо список всіх інтервалів з типом
+    all_intervals = []
+    for start, end in guaranteed:
+        all_intervals.append((start, end, 'guaranteed'))
+    for start, end in possible:
+        all_intervals.append((start, end, 'possible'))
+    
+    # Сортуємо за часом
+    all_intervals.sort(key=lambda x: x[0])
+    
+    # Форматуємо
+    formatted = []
+    for start, end, outage_type in all_intervals:
+        time_str = f"{start:02d}:00-{end:02d}:00"
+        if outage_type == 'guaranteed':
+            formatted.append(f"🔴 {time_str}")
+        else:  # possible
+            formatted.append(f"🟡 {time_str}")
+    
+    return formatted
+
+def format_all_periods(intervals):
+    """
+    Форматує всі періоди (відключення + електропостачання) в одному блоці
+    Кожен період на окремому рядку, відсортовані за часом
+    """
+    # Об'єднуємо гарантовані інтервали
+    guaranteed = merge_consecutive_intervals(intervals['guaranteed'])
+    possible = merge_consecutive_intervals(intervals['possible'])
+    
+    # Збираємо всі періоди відключень
+    all_outages = []
+    for start, end in guaranteed:
+        all_outages.append((start, end, '🔴', 'guaranteed'))
+    for start, end in possible:
+        all_outages.append((start, end, '🟡', 'possible'))
+    
+    # Сортуємо відключення за часом
+    all_outages.sort(key=lambda x: x[0])
+    
+    # Збираємо всі періоди електропостачання
+    power_periods = []
+    current_time = 0
+    
+    for start, end, emoji, outage_type in all_outages:
+        if current_time < start:
+            power_periods.append((current_time, start, '🟢', 'power'))
+        current_time = max(current_time, end)
+    
+    if current_time < 24:
+        power_periods.append((current_time, 24, '🟢', 'power'))
+    
+    # Об'єднуємо всі періоди
+    all_periods = all_outages + power_periods
+    
+    # Сортуємо за часом початку
+    all_periods.sort(key=lambda x: x[0])
+    
+    # Форматуємо кожен період на окремому рядку
+    formatted_lines = []
+    for start, end, emoji, period_type in all_periods:
+        time_str = f"{start:02d}:00-{end:02d}:00"
+        formatted_lines.append(f"{emoji} {time_str}")
+    
+    return formatted_lines
+
 # --- УНІВЕРСАЛЬНА ФУНКЦІЯ ВИДАЧІ ---
 async def send_schedule_logic(chat_id, subqueue, day_type="today", is_update=False):
     target_dt = datetime.now() if day_type == "today" else datetime.now() + timedelta(days=1)
     date_str = target_dt.strftime("%d.%m.%Y")
-    
-    # Отримуємо комбінований графік
-    combined = get_combined_schedule(date_str, subqueue, all_data)
-    
+
+    # Отримуємо розклад з кешу
+    schedule_text = get_schedule_for_date(date_str, subqueue)
+
+    # Якщо немає в кеші, пробуємо отримати з сайту
+    if not schedule_text:
+        all_data = await parse_hoe_smart()
+        short_date = target_dt.strftime("%d.%m.%y")
+        data = all_data.get(date_str) or all_data.get(short_date)
+
+        if data and data.get('list'):
+            schedule_text = normalize_schedule_text(data['list'].get(subqueue, ""))
+            # Зберігаємо в кеш
+            if schedule_text:
+                update_cached_schedule(date_str, subqueue, schedule_text, "full")
+
     # Отримуємо дані з сайту для зображення
     all_data = await parse_hoe_smart()
     short_date = target_dt.strftime("%d.%m.%y")
     data = all_data.get(date_str) or all_data.get(short_date)
 
-    if not data and combined['source'] == 'none':
+    img_url = data['img'] if data else None
+
+    if not schedule_text and not data:
         if day_type == "tomorrow":
             try:
                 await bot.send_message(chat_id, "🕠 <b>Графік на завтра ще не опубліковано.</b>\nЗазвичай він з'являється після <b>20:00</b>.", parse_mode="HTML")
@@ -675,56 +1054,49 @@ async def send_schedule_logic(chat_id, subqueue, day_type="today", is_update=Fal
                 logging.error(f"Failed to send message to {chat_id}: {e}")
         return
 
-    img_url = data['img'] if data else None
-    
     if is_update:
         try:
             if img_url:
                 await bot.send_photo(chat_id, photo=img_url, caption=f"🆕 <b>ОНОВЛЕННЯ НА САЙТІ!</b>\nГрафік на {date_str} вже доступний.", parse_mode="HTML")
             else:
                 await bot.send_message(chat_id, f"🆕 <b>ОНОВЛЕННЯ НА САЙТІ!</b>\nГрафік на {date_str} вже доступний.", parse_mode="HTML")
-            if not combined['guaranteed'] and not combined['possible']:
+            if not schedule_text:
                 await bot.send_message(chat_id, "📝 <b>Зверніть увагу:</b> Детальні списки годин відключень будуть розписані трохи пізніше (зазвичай протягом години).", parse_mode="HTML")
         except Exception as e:
             logging.error(f"Failed to send update to {chat_id}: {e}")
         return
 
     # Формуємо повідомлення
+    intervals = parse_schedule_to_intervals(schedule_text)
+
     if day_type == "today":
         # Перевіряємо статус світла тільки по гарантованих відключеннях
-        light_now = check_light_status(combined['guaranteed'])
-        status = "🟢 ЗАРАЗ СВІТЛО Є" if light_now else "🔴 ЗАРАЗ СВІТЛА НЕМАЄ"
+        guaranteed_text = "; ".join([f"{start:02d}:00-{end:02d}:00" for start, end in intervals['guaranteed']])
+        light_now = check_light_status(guaranteed_text)
+        status = "🟢 Електропостачання увімкнене" if light_now else "🔴 Електропостачання вимкнене"
         msg = f"<b>{status}</b>\n━━━━━━━━━━━━━━━\n"
     else:
         msg = "━━━━━━━━━━━━━━━\n"
-    
+
     msg += f"📅 <b>Графік на {date_str}</b>\n📍 Підчерга: <b>{subqueue}</b>\n\n"
+
+    # Форматуємо всі періоди в одному блоці
+    formatted_periods = format_all_periods(intervals)
     
-    # Відключення по порядку
-    all_outages = []
-    
-    # Гарантовані відключення
-    if combined['guaranteed']:
-        for t in combined['guaranteed'].split("; "):
-            if t.strip():
-                all_outages.append(f"• {t.strip()}")
-    
-    # Ймовірні відключення
-    if combined['possible']:
-        for t in combined['possible'].split("; "):
-            if t.strip():
-                all_outages.append(f"• {t.strip()} (можливо)")
-    
-    if all_outages:
-        msg += f"🕒 <b>ВІДКЛЮЧЕННЯ:</b>\n"
-        msg += "\n".join(all_outages)
+    if formatted_periods:
+        msg += f"⚡ <b>ВІДКЛЮЧЕННЯ:</b>\n"
+        msg += "\n".join(formatted_periods)
+        msg += "\n\n"
+        msg += "🟡 - електропостачання можливе\n"
+        msg += "🔴 - електропостачання вимкнене\n"
+        msg += "🟢 - електропостачання увімкнене"
     else:
         msg += "🕒 <b>ВІДКЛЮЧЕНЬ НЕМАЄ</b>"
-    
+
     msg += "\n━━━━━━━━━━━━━━━"
-    
-    # Генеруємо годинник з обома типами відключень
-    clock_file = generate_clock_image(subqueue, combined['guaranteed'], combined['possible'], date_str)
+
+    # Генеруємо годинник з об'єднаним текстом
+    clock_file = generate_clock_image(subqueue, schedule_text, date_str)
     
     try:
         await bot.send_photo(chat_id, photo=types.FSInputFile(clock_file), caption=msg, parse_mode="HTML")
@@ -1613,22 +1985,290 @@ def normalize_schedule_text(text):
     text = re.sub(r'з\s+', '', text)  # remove 'з '
     text = re.sub(r'\s+до\s+', '-', text)  # ' до ' to '-'
     text = re.sub(r';\s*$', '', text)  # remove trailing ;
+
+    # Обробка OCR формату: "Вимкнено: 07:00-08:00, 14:00-15:00; Можливо вимкнено: 09:00-10:00"
+    if "Вимкнено:" in text or "Можливо вимкнено:" in text:
+        parts = []
+        if "Вимкнено:" in text:
+            off_part = text.split("Вимкнено:")[1].split(";")[0].strip()
+            parts.append(off_part)
+        if "Можливо вимкнено:" in text:
+            possible_part = text.split("Можливо вимкнено:")[1].strip()
+            parts.append(possible_part)
+        text = "; ".join(parts)
+
     return text
 
 async def monitor_job():
+    """
+    Моніторинг нових графіків з OCR парсингом і кешуванням
+    """
     try:
+        logging.info("Starting monitor job with OCR parsing")
+
+        # Отримуємо дані з сайту
         all_data = await parse_hoe_smart()
-        if not all_data: 
+        if not all_data:
             logging.info("No data parsed from site")
             return
 
         logging.info(f"Parsed data for dates: {list(all_data.keys())}")
-        
+
         conn = sqlite3.connect('users.db')
         cursor = conn.cursor()
-        
-        # Load known schedules
-        cursor.execute('SELECT value FROM settings WHERE key = "known_schedules"')
+
+        # Завантажуємо кешовані розклади
+        cached_schedules = load_cached_schedules()
+        logging.info(f"Loaded cached schedules for dates: {list(cached_schedules.keys())}")
+
+        now = datetime.now()
+        current_date_str = now.strftime("%d.%m.%Y")
+        updated_dates = []
+
+        for date_key, data in all_data.items():
+            try:
+                # Пропускаємо минулі дати
+                try:
+                    date_dt = datetime.strptime(date_key, "%d.%m.%Y")
+                except ValueError:
+                    try:
+                        date_dt = datetime.strptime(date_key, "%d.%m.%y")
+                        date_dt = date_dt.replace(year=2000 + date_dt.year % 100)
+                    except ValueError:
+                        continue
+
+                if date_dt.date() < now.date():
+                    logging.info(f"Skipping past date {date_key}")
+                    continue
+
+                # Перевіряємо чи є зміни в графіку
+                img_url = data.get('img', '')
+                has_image = data.get('has_image', False)
+                parsed_list = data.get('list', {})
+
+                # Отримуємо кешований розклад для цієї дати
+                cached_date_data = cached_schedules.get(date_key, {})
+
+                # Визначаємо тип зміни
+                is_new_schedule = date_key not in cached_schedules
+                img_changed = cached_date_data.get('img_url', '') != img_url
+                has_new_image = has_image and not cached_date_data.get('has_image', False)
+
+                logging.info(f"Checking {date_key}: is_new={is_new_schedule}, img_changed={img_changed}, has_image={has_image}")
+
+                if is_new_schedule or img_changed or has_new_image:
+                    logging.info(f"Detected change for {date_key}, parsing with OCR")
+
+                    # Парсимо графік через OCR
+                    if has_image and img_url:
+                        ocr_schedules = await parse_schedule_image(img_url)
+                        logging.info(f"OCR parsed {len(ocr_schedules)} subqueues for {date_key}")
+
+                        # Зберігаємо в кеш
+                        for subqueue, schedule_text in ocr_schedules.items():
+                            update_cached_schedule(date_key, subqueue, schedule_text, "full")
+
+                        # Позначаємо що є оновлення
+                        cached_schedules[date_key] = {
+                            'img_url': img_url,
+                            'has_image': True,
+                            'last_updated': now.isoformat(),
+                            'subqueues': list(ocr_schedules.keys())
+                        }
+
+                        updated_dates.append(date_key)
+
+                        # Генеруємо годинники для всіх черг
+                        for subqueue in ocr_schedules.keys():
+                            schedule_text = ocr_schedules[subqueue]
+                            generate_clock_image(subqueue, schedule_text, date_key)
+                            logging.info(f"Generated clock for {subqueue} on {date_key}")
+
+                    save_cached_schedules(cached_schedules)
+
+                # Якщо є текстовий опис але немає зображення - використовуємо текст
+                elif parsed_list and not has_image:
+                    logging.info(f"Using text schedule for {date_key}")
+                    for subqueue, schedule_text in parsed_list.items():
+                        normalized_text = normalize_schedule_text(schedule_text)
+                        update_cached_schedule(date_key, subqueue, normalized_text, "full")
+
+                        # Генеруємо годинник
+                        generate_clock_image(subqueue, normalized_text, date_key)
+
+                    updated_dates.append(date_key)
+
+            except Exception as e:
+                logging.error(f"Error processing date {date_key}: {e}")
+                continue
+
+        # Зберігаємо оновлені кешовані розклади
+        cursor.execute('INSERT OR REPLACE INTO settings (key, value) VALUES ("cached_schedules", ?)',
+                      (json.dumps(cached_schedules),))
+        conn.commit()
+
+        logging.info(f"Updated dates: {updated_dates}")
+
+        # Тепер обробляємо сповіщення для сьогодні і завтра
+        today_str = now.strftime("%d.%m.%Y")
+        tomorrow = now + timedelta(days=1)
+        tomorrow_str = tomorrow.strftime("%d.%m.%Y")
+
+        # Отримуємо розклади для сповіщень
+        today_schedules = {}
+        tomorrow_schedules = {}
+
+        for date_key in [today_str, tomorrow_str]:
+            date_schedules = cached_schedules.get(date_key, {})
+            if isinstance(date_schedules, dict) and 'subqueues' in date_schedules:
+                # Отримуємо розклади з кешу
+                for subqueue in date_schedules['subqueues']:
+                    schedule_text = get_schedule_for_date(date_key, subqueue)
+                    if schedule_text:
+                        if date_key == today_str:
+                            today_schedules[subqueue] = schedule_text
+                        else:
+                            tomorrow_schedules[subqueue] = schedule_text
+
+        logging.info(f"Today schedules: {len(today_schedules)} subqueues")
+        logging.info(f"Tomorrow schedules: {len(tomorrow_schedules)} subqueues")
+
+        # Обробляємо сповіщення (залишаємо існуючу логіку але з новими даними)
+        for sub_q in today_schedules.keys():
+            try:
+                time_text_today = today_schedules.get(sub_q, "")
+                time_text_tomorrow = tomorrow_schedules.get(sub_q, "")
+
+                # Збираємо всі інтервали для сьогодні і завтра
+                combined_intervals = []
+
+                # Інтервали сьогодні (гарантовані + можливі)
+                intervals_today = parse_schedule_to_intervals(time_text_today)
+                for start_hour, end_hour in intervals_today['guaranteed'] + intervals_today['possible']:
+                    start_dt = datetime.combine(now.date(), datetime.min.time()) + timedelta(hours=start_hour)
+                    end_dt = datetime.combine(now.date(), datetime.min.time()) + timedelta(hours=end_hour)
+                    if end_dt <= start_dt:
+                        end_dt += timedelta(days=1)
+                    combined_intervals.append((start_dt, end_dt))
+
+                # Інтервали завтра
+                intervals_tomorrow = parse_schedule_to_intervals(time_text_tomorrow)
+                for start_hour, end_hour in intervals_tomorrow['guaranteed'] + intervals_tomorrow['possible']:
+                    start_dt = datetime.combine(tomorrow.date(), datetime.min.time()) + timedelta(hours=start_hour)
+                    end_dt = datetime.combine(tomorrow.date(), datetime.min.time()) + timedelta(hours=end_hour)
+                    if end_dt <= start_dt:
+                        end_dt += timedelta(days=1)
+                    combined_intervals.append((start_dt, end_dt))
+
+                # Знаходимо точки зміни в найближчі 30 хв
+                t30_dt = now + timedelta(minutes=30)
+                user_alerts = {}  # uid -> list of (change_dt, is_shutdown, addr_names, is_possible)
+
+                for start_dt, end_dt in combined_intervals:
+                    # Визначаємо тип відключення (гарантоване чи можливе)
+                    is_possible = any(
+                        start_dt.hour >= start_hour and end_dt.hour <= end_hour
+                        for start_hour, end_hour in intervals_today['possible'] + intervals_tomorrow['possible']
+                    )
+
+                    change_points = [(start_dt, True, is_possible), (end_dt, False, is_possible)]
+                    for change_dt, is_shutdown, is_possible in change_points:
+                        if now < change_dt <= t30_dt:
+                            minutes_left = int((change_dt - now).total_seconds() / 60)
+                            change_time_str = change_dt.strftime("%H:%M")
+                            event_date = change_dt.strftime("%Y-%m-%d")
+
+                            # Знаходимо користувачів з цією чергою
+                            cursor.execute('SELECT user_id, GROUP_CONCAT(name) FROM addresses WHERE subqueue = ? GROUP BY user_id', (sub_q,))
+                            users_in_q = cursor.fetchall()
+                            for uid, addr_names_str in users_in_q:
+                                # Перевіряємо налаштування
+                                general_settings = get_user_notification_settings(uid)
+                                if not general_settings['notifications_enabled']:
+                                    continue
+
+                                addr_list = addr_names_str.split(',')
+                                enabled_addrs = []
+                                for addr_name in addr_list:
+                                    addr_settings = get_user_notification_settings(uid, addr_name.strip())
+                                    if addr_settings['notifications_enabled']:
+                                        enabled_addrs.append(addr_name.strip())
+
+                                if not enabled_addrs:
+                                    continue
+
+                                if uid not in user_alerts:
+                                    user_alerts[uid] = []
+                                user_alerts[uid].append((change_dt, is_shutdown, enabled_addrs, sub_q, is_possible))
+
+                # Надсилаємо сповіщення користувачам
+                for uid, alerts in user_alerts.items():
+                    # Групуємо за часом
+                    time_groups = {}
+                    for change_dt, is_shutdown, addrs, subq, is_possible in alerts:
+                        key = (change_dt, is_shutdown, is_possible)
+                        if key not in time_groups:
+                            time_groups[key] = []
+                        time_groups[key].extend(addrs)
+
+                    for (change_dt, is_shutdown, is_possible), addr_list in time_groups.items():
+                        minutes_left = int((change_dt - now).total_seconds() / 60)
+                        change_time_str = change_dt.strftime("%H:%M")
+                        event_date = change_dt.strftime("%Y-%m-%d")
+
+                        # Перевіряємо, чи вже надсилали
+                        cursor.execute('SELECT 1 FROM sent_alerts WHERE user_id=? AND event_time=? AND event_date=?',
+                                       (uid, change_time_str, event_date))
+                        if cursor.fetchone():
+                            continue
+
+                        if is_shutdown:
+                            if is_possible:
+                                alert_base = f"⚠️ <b>Увага! Можливе відключення світла</b>\n\nЧерез {minutes_left} хв ({change_time_str}) можливе припинення подачі електроенергії"
+                            else:
+                                alert_base = f"⚠️ <b>Увага! Відключення світла</b>\n\nЧерез {minutes_left} хв ({change_time_str}) подача електроенергії буде <b>припинена</b>"
+                        else:
+                            if is_possible:
+                                alert_base = f"✅ <b>Можливе відновлення електроенергії</b>\n\nЧерез {minutes_left} хв ({change_time_str}) можливе відновлення подачі електроенергії"
+                            else:
+                                alert_base = f"✅ <b>Відновлення електроенергії</b>\n\nЧерез {minutes_left} хв ({change_time_str}) подача електроенергії буде <b>відновлена</b>"
+
+                        if len(addr_list) == 1:
+                            alert_msg = f"{alert_base} для вашої адреси <b>{addr_list[0]}</b>."
+                        else:
+                            addr_text = ", ".join(addr_list)
+                            alert_msg = f"{alert_base} для ваших адрес: <b>{addr_text}</b>."
+
+                        try:
+                            await bot.send_message(uid, alert_msg, parse_mode="HTML")
+                            cursor.execute('INSERT INTO sent_alerts VALUES (?, ?, ?)', (uid, change_time_str, event_date))
+                            conn.commit()
+                        except Exception as e:
+                            logging.error(f"Failed to send alert to {uid}: {e}")
+            except Exception as e:
+                logging.error(f"Error processing subqueue {sub_q}: {e}")
+                continue
+
+        # Clean up old sent alerts (older than today)
+        logging.info("Cleaning up old sent_alerts")
+        cursor.execute('DELETE FROM sent_alerts WHERE event_date < ?', (now.strftime("%Y-%m-%d"),))
+        conn.commit()
+
+        # Delete old clock files for updated dates
+        for date_key in updated_dates:
+            date_clean = date_key.replace('.', '_')
+            for file in os.listdir('clocks'):
+                if date_clean in file and file.endswith('.png'):
+                    try:
+                        os.remove(os.path.join('clocks', file))
+                    except:
+                        pass
+
+        conn.close()
+        logging.info("Monitor job completed successfully")
+
+    except Exception as e:
+        logging.error(f"Error in monitor_job: {e}")
         res = cursor.fetchone()
         known_schedules = json.loads(res[0]) if res and res[0] else {}
         logging.info(f"Loaded known_schedules: {list(known_schedules.keys())}")
