@@ -18,7 +18,7 @@ from database import init_db
 from handlers import router as handlers_router
 
 # Import monitoring
-from utils.monitoring import monitor_job
+from utils.monitoring import monitor_job, send_upcoming_events_notifications
 
 # Import cache initialization
 from utils.cache import initialize_cache, update_clock_time_hands
@@ -45,6 +45,7 @@ async def main():
     # Start scheduler
     scheduler.add_job(monitor_job, 'interval', minutes=5)
     scheduler.add_job(update_clock_time_hands, 'interval', hours=1)
+    scheduler.add_job(send_upcoming_events_notifications, 'cron', minute=30)  # Every hour at :30
     scheduler.start()
 
     # Start polling

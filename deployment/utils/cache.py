@@ -114,7 +114,7 @@ async def check_and_update_cache():
         all_data = await parse_hoe_smart()
         if not all_data:
             logging.warning("No data received from site during update check")
-            return False
+            return False, {}
 
         # Load current cache
         current_cache = load_cached_schedules()
@@ -122,10 +122,12 @@ async def check_and_update_cache():
         # Check if data has changed
         has_changes = False
         new_cache = {}
+        changes = {}  # date -> {'new': [], 'changed': []}
 
         for date_key, data in all_data.items():
             if 'schedules' in data and data['schedules']:
                 new_cache[date_key] = {}
+                changes[date_key] = {'new': [], 'changed': []}
                 for subqueue, schedule_text in data['schedules'].items():
                     normalized_text = normalize_schedule_text(schedule_text)
                     if normalized_text:
@@ -135,11 +137,15 @@ async def check_and_update_cache():
                         current_schedule = current_cache.get(date_key, {}).get(subqueue, "")
                         if normalized_text != current_schedule:
                             has_changes = True
-                            logging.info(f"Schedule changed for {subqueue} on {date_key}")
+                            if not current_schedule:
+                                changes[date_key]['new'].append(subqueue)
+                            else:
+                                changes[date_key]['changed'].append(subqueue)
+                            logging.info(f"Schedule {'new' if not current_schedule else 'changed'} for {subqueue} on {date_key}")
 
         if not has_changes:
             logging.info("No schedule changes detected")
-            return False
+            return False, {}
 
         # Data changed - update cache and regenerate clocks
         logging.info(f"Detected changes, updating cache with {len(new_cache)} dates and {sum(len(schedules) for schedules in new_cache.values())} schedules")
@@ -151,13 +157,13 @@ async def check_and_update_cache():
         await generate_all_clocks_for_cache(new_cache)
         logging.info("Cache and clocks updated")
 
-        return True
+        return True, changes
 
     except Exception as e:
         logging.error(f"Error checking for updates: {e}")
         import traceback
         traceback.print_exc()
-        return False
+        return False, {}
 
 async def generate_all_clocks_for_cache(cached_schedules):
     """Generate clock images for all cached schedules"""
