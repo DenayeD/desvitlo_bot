@@ -71,7 +71,7 @@ async def settings_general(callback: types.CallbackQuery):
     try:
         with get_db_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute('SELECT COUNT(*) FROM user_notifications WHERE user_id = ? AND address_name IS NULL', (user_id,))
+            cursor.execute('SELECT COUNT(*) FROM user_notifications WHERE user_id = ? AND address_name = ?', (user_id, ''))
             if cursor.fetchone()[0] == 0:
                 # Ініціалізуємо загальні налаштування за замовчуванням
                 set_user_notification_settings(user_id, None, True, True, True)

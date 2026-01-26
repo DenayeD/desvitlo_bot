@@ -7,11 +7,8 @@ def get_user_notification_settings(user_id, address_name=None):
         with get_db_connection() as conn:
             cursor = conn.cursor()
             if address_name is None:
-                # General settings
-                cursor.execute('SELECT notifications_enabled, new_schedule_enabled, schedule_changes_enabled FROM user_notifications WHERE user_id = ? AND address_name IS NULL', (user_id,))
-            else:
-                # Settings for specific address
-                cursor.execute('SELECT notifications_enabled, new_schedule_enabled, schedule_changes_enabled FROM user_notifications WHERE user_id = ? AND address_name = ?', (user_id, address_name))
+                address_name = ''
+            cursor.execute('SELECT notifications_enabled, new_schedule_enabled, schedule_changes_enabled FROM user_notifications WHERE user_id = ? AND address_name = ?', (user_id, address_name))
             res = cursor.fetchone()
             logging.info(f"Get settings for user {user_id}, addr {address_name}: {res}")
             if res:
@@ -45,6 +42,9 @@ def set_user_notification_settings(user_id, address_name, notifications_enabled,
             notifications_enabled = int(notifications_enabled)
             new_schedule_enabled = int(new_schedule_enabled)
             schedule_changes_enabled = int(schedule_changes_enabled)
+
+            if address_name is None:
+                address_name = ''
 
             logging.info(f"Setting notifications for user {user_id}, addr {address_name}: {notifications_enabled}, {new_schedule_enabled}, {schedule_changes_enabled}")
 

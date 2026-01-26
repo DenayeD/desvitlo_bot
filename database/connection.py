@@ -54,12 +54,15 @@ def init_db():
     # Notification settings
     cursor.execute('''CREATE TABLE IF NOT EXISTS user_notifications (
         user_id INTEGER,
-        address_name TEXT,
+        address_name TEXT NOT NULL DEFAULT '',
         notifications_enabled BOOLEAN DEFAULT 1,
         new_schedule_enabled BOOLEAN DEFAULT 1,
         schedule_changes_enabled BOOLEAN DEFAULT 1,
         PRIMARY KEY (user_id, address_name)
     )''')
+
+    # Migrate NULL address_name to '' - delete old NULL rows
+    cursor.execute('DELETE FROM user_notifications WHERE address_name IS NULL')
 
     # Manual schedules for admins
     cursor.execute('''CREATE TABLE IF NOT EXISTS manual_schedules (
@@ -88,9 +91,9 @@ def init_db():
     all_users = cursor.fetchall()
     for (user_id,) in all_users:
         # General settings
-        cursor.execute('SELECT COUNT(*) FROM user_notifications WHERE user_id = ? AND address_name IS NULL', (user_id,))
+        cursor.execute('SELECT COUNT(*) FROM user_notifications WHERE user_id = ? AND address_name = ?', (user_id, ''))
         if cursor.fetchone()[0] == 0:
-            cursor.execute('INSERT INTO user_notifications (user_id, address_name, notifications_enabled, new_schedule_enabled, schedule_changes_enabled) VALUES (?, NULL, 1, 1, 1)', (user_id,))
+            cursor.execute('INSERT INTO user_notifications (user_id, address_name, notifications_enabled, new_schedule_enabled, schedule_changes_enabled) VALUES (?, ?, 1, 1, 1)', (user_id, ''))
         # Settings for addresses
         cursor.execute('SELECT name FROM addresses WHERE user_id = ?', (user_id,))
         addresses = cursor.fetchall()
