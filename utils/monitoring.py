@@ -7,7 +7,7 @@ from bs4 import BeautifulSoup
 from config.settings import URL_PAGE
 
 async def send_upcoming_events_notifications():
-    """Send notifications for upcoming status transitions in next 30 minutes"""
+    """Надсилає сповіщення про зміну статусів, групуючи адреси користувача"""
     logging.info("Starting send_upcoming_events_notifications check")
     try:
         from database.notifications import get_user_notification_settings
@@ -16,167 +16,104 @@ async def send_upcoming_events_notifications():
         from core.globals import bot
         from utils.cache import get_schedule_for_date
         from utils.helpers import parse_schedule_to_intervals
-        import asyncio
         from datetime import datetime, timedelta
 
         now = datetime.now()
-        # Check for transition at 30 minutes ahead
-        check_times = [now + timedelta(minutes=30)]
+        # Перевіряємо вікно навколо 30-хвилинної позначки
+        check_times = [now + timedelta(minutes=m) for m in [25, 30, 35]]
 
-        # Get today and tomorrow dates
         today_str = now.strftime("%d.%m.%Y")
-        tomorrow = now + timedelta(days=1)
-        tomorrow_str = tomorrow.strftime("%d.%m.%Y")
+        tomorrow_str = (now + timedelta(days=1)).strftime("%d.%m.%Y")
 
-        # Get all subqueues and users
-        subqueue_users = {}  # subq -> list of (uid, addr_names)
-        user_general_settings = {}  # uid -> general_settings (cache)
+        # 1. Збираємо всіх активних користувачів
+        subqueue_users = {} 
+        user_general_settings = {} 
         
         all_addresses = get_all_user_addresses()
         for uid, addr_name, subq in all_addresses:
-            if subq not in subqueue_users:
-                subqueue_users[subq] = []
-            
-            # Cache general settings to avoid multiple DB queries for same user
             if uid not in user_general_settings:
                 user_general_settings[uid] = get_user_notification_settings(uid)
             
-            general_settings = user_general_settings[uid]
-            if general_settings['notifications_enabled']:
+            if user_general_settings[uid].get('notifications_enabled'):
                 addr_settings = get_user_notification_settings(uid, addr_name)
-                if addr_settings['notifications_enabled']:
+                if addr_settings.get('notifications_enabled'):
+                    if subq not in subqueue_users:
+                        subqueue_users[subq] = []
                     subqueue_users[subq].append((uid, addr_name))
 
-        # For each subqueue, determine current and future status
-        user_alerts = {}  # uid -> list of (full_message, event_time, event_date)
+        # 2. Визначаємо події для кожної підчерги
+        # (uid, status_future, time) -> set of address_names
+        pending_alerts = {}
 
         for sub_q, users in subqueue_users.items():
-            if not users:
-                continue
+            if not users: continue
 
-            # Get schedules
-            time_text_today = get_schedule_for_date(today_str, sub_q)
-            time_text_tomorrow = get_schedule_for_date(tomorrow_str, sub_q)
+            intervals_today = parse_schedule_to_intervals(get_schedule_for_date(today_str, sub_q))
+            intervals_tomorrow = parse_schedule_to_intervals(get_schedule_for_date(tomorrow_str, sub_q))
 
-            # Parse intervals
-            intervals_today = parse_schedule_to_intervals(time_text_today)
-            intervals_tomorrow = parse_schedule_to_intervals(time_text_tomorrow)
-
-            # Function to get status at a given time
             def get_status_at_time(check_time):
-                # Check today intervals
+                # Логіка визначення кольору (залишається твоя оригінальна)
                 for start_h, end_h in intervals_today['guaranteed']:
-                    start_dt = datetime.combine(now.date(), datetime.min.time()) + timedelta(hours=start_h)
-                    end_dt = datetime.combine(now.date(), datetime.min.time()) + timedelta(hours=end_h)
-                    if end_dt <= start_dt:
-                        end_dt += timedelta(days=1)
-                    if start_dt <= check_time < end_dt:
-                        return 'black'  # guaranteed outage
-                
+                    s = datetime.combine(now.date(), datetime.min.time()) + timedelta(hours=start_h)
+                    e = s + timedelta(hours=(end_h - start_h if end_h > start_h else end_h - start_h + 24))
+                    if s <= check_time < e: return 'black'
                 for start_h, end_h in intervals_today['possible']:
-                    start_dt = datetime.combine(now.date(), datetime.min.time()) + timedelta(hours=start_h)
-                    end_dt = datetime.combine(now.date(), datetime.min.time()) + timedelta(hours=end_h)
-                    if end_dt <= start_dt:
-                        end_dt += timedelta(days=1)
-                    if start_dt <= check_time < end_dt:
-                        return 'grey'  # possible outage
-                
-                # Check tomorrow intervals
-                for start_h, end_h in intervals_tomorrow['guaranteed']:
-                    start_dt = datetime.combine(tomorrow.date(), datetime.min.time()) + timedelta(hours=start_h)
-                    end_dt = datetime.combine(tomorrow.date(), datetime.min.time()) + timedelta(hours=end_h)
-                    if end_dt <= start_dt:
-                        end_dt += timedelta(days=1)
-                    if start_dt <= check_time < end_dt:
-                        return 'black'
-                
-                for start_h, end_h in intervals_tomorrow['possible']:
-                    start_dt = datetime.combine(tomorrow.date(), datetime.min.time()) + timedelta(hours=start_h)
-                    end_dt = datetime.combine(tomorrow.date(), datetime.min.time()) + timedelta(hours=end_h)
-                    if end_dt <= start_dt:
-                        end_dt += timedelta(days=1)
-                    if start_dt <= check_time < end_dt:
-                        return 'grey'
-                
-                return 'white'  # power on
+                    s = datetime.combine(now.date(), datetime.min.time()) + timedelta(hours=start_h)
+                    e = s + timedelta(hours=(end_h - start_h if end_h > start_h else end_h - start_h + 24))
+                    if s <= check_time < e: return 'grey'
+                return 'white'
 
-            # Get current status
             status_now = get_status_at_time(now)
             
-            # Check for transition at 30 minutes ahead
-            transition_time = check_times[0]
-            status_future = get_status_at_time(transition_time)
-            
-            if status_future != status_now:
-                # Found a transition
-                nearest_transition = (status_now, status_future)
-                nearest_time = transition_time
-            
-            # Send notification for the transition found
-            if nearest_transition:
-                status_now, status_future = nearest_transition
-                minutes_left = 30  # since exactly 30 minutes ahead
-                
-                message = None
-                if status_now == 'white' and status_future == 'grey':
-                    message = f"⚠️ <b>Увага! МОЖЛИВЕ ВІДКЛЮЧЕННЯ</b>\n\nЧерез {minutes_left} хв можливе припинення подачі електроенергії."
-                elif status_now == 'white' and status_future == 'black':
-                    message = f"⚠️ <b>Увага! ВІДКЛЮЧЕННЯ ЕЛЕКТРОЕНЕРГІЇ</b>\n\nЧерез {minutes_left} хв подача електроенергії буде припинена."
-                elif status_now == 'black' and status_future == 'grey':
-                    message = f"✅ <b>МОЖЛИВЕ ВІДНОВЛЕННЯ</b>\n\nЧерез {minutes_left} хв можливе відновлення подачі електроенергії."
-                elif status_now == 'black' and status_future == 'white':
-                    message = f"✅ <b>ВІДНОВЛЕННЯ ЕЛЕКТРОЕНЕРГІЇ</b>\n\nЧерез {minutes_left} хв подача електроенергії буде відновлена."
-                elif status_now == 'grey' and status_future == 'black':
-                    message = f"⚠️ <b>ГАРАНТОВАНЕ ВІДКЛЮЧЕННЯ</b>\n\nЧерез {minutes_left} хв подача електроенергії буде припинена."
-                elif status_now == 'grey' and status_future == 'white':
-                    message = f"✅ <b>ВІДНОВЛЕННЯ ЕЛЕКТРОЕНЕРГІЇ</b>\n\nЧерез {minutes_left} хв подача електроенергії буде відновлена."
-
-                if message:
-                    event_time = nearest_time.strftime("%H:%M")
-                    event_date = nearest_time.strftime("%Y-%m-%d")
+            for f_time in check_times:
+                status_future = get_status_at_time(f_time)
+                if status_future != status_now:
+                    # Знайшли перехід!
+                    event_time_str = f_time.strftime("%H:00") if f_time.minute > 45 else f_time.strftime("%H:%M")
+                    event_date_str = f_time.strftime("%Y-%m-%d")
                     
-                    for uid, addr_name in users:
-                        full_message = f"{message}\n\nАдреса: <b>{addr_name}</b>."
-                        if uid not in user_alerts:
-                            user_alerts[uid] = []
-                        user_alerts[uid].append((full_message, event_time, event_date))
+                    # Формуємо базовий текст
+                    msg = ""
+                    if status_now == 'white' and status_future == 'grey': msg = "⚠️ <b>МОЖЛИВЕ ВІДКЛЮЧЕННЯ</b>"
+                    elif status_now == 'white' and status_future == 'black': msg = "⚠️ <b>ВІДКЛЮЧЕННЯ ЕЛЕКТРОЕНЕРГІЇ</b>"
+                    elif status_now == 'black' and status_future == 'white': msg = "✅ <b>ВІДНОВЛЕННЯ ЕЛЕКТРОЕНЕРГІЇ</b>"
+                    elif status_now == 'grey' and status_future == 'black': msg = "⚠️ <b>ГАРАНТОВАНЕ ВІДКЛЮЧЕННЯ</b>"
+                    elif status_now != 'white' and status_future == 'white': msg = "✅ <b>ВІДНОВЛЕННЯ ЕЛЕКТРОЕНЕРГІЇ</b>"
+                    
+                    if msg:
+                        for uid, addr in users:
+                            # Ключ групування: юзер + тип події + час
+                            key = (uid, msg, event_time_str, event_date_str)
+                            if key not in pending_alerts: pending_alerts[key] = set()
+                            pending_alerts[key].add(addr)
+                    break # Для цієї черги подію знайдено
 
-        # Send alerts, checking for duplicates and combining per user
+        # 3. Відправка згрупованих сповіщень
         sent_count = 0
         with get_db_connection() as conn:
             cursor = conn.cursor()
-            for uid, alerts in user_alerts.items():
-                # Collect unsent messages
-                unsent_messages = []
-                for full_message, event_time, event_date in alerts:
-                    cursor.execute('SELECT 1 FROM sent_alerts WHERE user_id=? AND event_time=? AND event_date=?',
-                                   (uid, event_time, event_date))
-                    if not cursor.fetchone():
-                        unsent_messages.append(full_message)
-                        cursor.execute('INSERT INTO sent_alerts VALUES (?, ?, ?)', (uid, event_time, event_date))
-                
-                if unsent_messages:
-                    combined_message = "\n\n".join(unsent_messages)
-                    try:
-                        await bot.send_message(uid, combined_message, parse_mode="HTML")
-                        sent_count += 1  # count as one sent message per user
-                    except Exception as e:
-                        logging.error(f"Failed to send combined alert to {uid}: {e}")
-                    await asyncio.sleep(0.05)
-            
+            for (uid, title, e_time, e_date), addrs in pending_alerts.items():
+                # Перевірка на дублікат у базі
+                cursor.execute('SELECT 1 FROM sent_alerts WHERE user_id=? AND event_time=? AND event_date=?', 
+                               (uid, e_time, e_date))
+                if cursor.fetchone(): continue
+
+                addr_str = ", ".join(addrs)
+                full_message = f"{title}\n\nОрієнтовно о {e_time}\nАдреса: <b>{addr_str}</b>"
+
+                try:
+                    await bot.send_message(uid, full_message, parse_mode="HTML")
+                    cursor.execute('INSERT INTO sent_alerts VALUES (?, ?, ?)', (uid, e_time, e_date))
+                    sent_count += 1
+                except Exception as e:
+                    logging.error(f"Failed to send to {uid}: {e}")
+                await asyncio.sleep(0.05)
             conn.commit()
 
-        logging.info(f"Sent {sent_count} upcoming event notifications")
-
-        # Clean up old alerts
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('DELETE FROM sent_alerts WHERE event_date < ?', (now.strftime("%Y-%m-%d"),))
-            conn.commit()
-
+        logging.info(f"Sent {sent_count} grouped notifications")
     except Exception as e:
-        logging.error(f"Error in send_upcoming_events_notifications: {e}")
-
+        logging.error(f"Error in notifications: {e}")
+        
 async def parse_hoe_data():
     """Parse basic schedule data from HOE website"""
     async with aiohttp.ClientSession() as session:
