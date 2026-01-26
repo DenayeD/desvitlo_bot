@@ -8,9 +8,10 @@ from config.settings import URL_PAGE
 
 async def send_upcoming_events_notifications():
     """Send notifications for upcoming status transitions in next 30 minutes"""
+    logging.info("Starting send_upcoming_events_notifications check")
     try:
         from database.notifications import get_user_notification_settings
-        from database.addresses import get_user_addresses
+        from database.addresses import get_all_user_addresses
         from database.connection import get_db_connection
         from core.globals import bot
         from utils.cache import get_schedule_for_date
@@ -30,12 +31,18 @@ async def send_upcoming_events_notifications():
 
         # Get all subqueues and users
         subqueue_users = {}  # subq -> list of (uid, addr_names)
-        all_addresses = get_user_addresses()
+        user_general_settings = {}  # uid -> general_settings (cache)
+        
+        all_addresses = get_all_user_addresses()
         for uid, addr_name, subq in all_addresses:
             if subq not in subqueue_users:
                 subqueue_users[subq] = []
-            # Get enabled addresses for this user
-            general_settings = get_user_notification_settings(uid)
+            
+            # Cache general settings to avoid multiple DB queries for same user
+            if uid not in user_general_settings:
+                user_general_settings[uid] = get_user_notification_settings(uid)
+            
+            general_settings = user_general_settings[uid]
             if general_settings['notifications_enabled']:
                 addr_settings = get_user_notification_settings(uid, addr_name)
                 if addr_settings['notifications_enabled']:

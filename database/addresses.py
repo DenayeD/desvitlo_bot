@@ -64,3 +64,11 @@ def delete_user_address(user_id, name):
             # Remove settings for this address
             cursor.execute('DELETE FROM user_notifications WHERE user_id = ? AND address_name = ?', (user_id, name))
         conn.commit()
+
+def get_all_user_addresses():
+    """Get all user addresses for all users (for monitoring)"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT user_id, name, subqueue FROM addresses ORDER BY user_id, name')
+        addresses = cursor.fetchall()
+        return addresses
