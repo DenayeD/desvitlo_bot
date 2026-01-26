@@ -20,9 +20,8 @@ async def send_upcoming_events_notifications():
         from datetime import datetime, timedelta
 
         now = datetime.now()
-        # Check for transitions in the next 25-35 minutes window
-        # We'll check every minute to catch all possible transitions
-        check_times = [now + timedelta(minutes=minutes) for minutes in range(25, 36)]
+        # Check for transition at 30 minutes ahead
+        check_times = [now + timedelta(minutes=30)]
 
         # Get today and tomorrow dates
         today_str = now.strftime("%d.%m.%Y")
@@ -48,8 +47,8 @@ async def send_upcoming_events_notifications():
                 if addr_settings['notifications_enabled']:
                     subqueue_users[subq].append((uid, addr_name))
 
-        # For each subqueue, determine current and future status for multiple time points
-        user_grouped_alerts = {}  # (uid, message, event_time, event_date) -> list of addr_names
+        # For each subqueue, determine current and future status
+        user_alerts = {}  # uid -> list of (full_message, event_time, event_date)
 
         for sub_q, users in subqueue_users.items():
             if not users:
@@ -104,74 +103,66 @@ async def send_upcoming_events_notifications():
             # Get current status
             status_now = get_status_at_time(now)
             
-            # Find the nearest transition in the 25-35 minute window
-            nearest_transition = None
-            nearest_time = None
+            # Check for transition at 30 minutes ahead
+            transition_time = check_times[0]
+            status_future = get_status_at_time(transition_time)
             
-            for future_time in check_times:
-                status_future = get_status_at_time(future_time)
-                
-                if status_future != status_now:
-                    # Found a transition
-                    if nearest_transition is None or future_time < nearest_time:
-                        nearest_transition = (status_now, status_future)
-                        nearest_time = future_time
+            if status_future != status_now:
+                # Found a transition
+                nearest_transition = (status_now, status_future)
+                nearest_time = transition_time
             
-            # Send notification for the nearest transition found
+            # Send notification for the transition found
             if nearest_transition:
                 status_now, status_future = nearest_transition
-                minutes_left = int((nearest_time - now).total_seconds() / 60)
+                minutes_left = 30  # since exactly 30 minutes ahead
                 
                 message = None
                 if status_now == 'white' and status_future == 'grey':
-                    message = f"⚠️ <b>Увага! Можливе відключення світла</b>\n\nЧерез {minutes_left} хв можливе припинення подачі електроенергії."
+                    message = f"⚠️ <b>Увага! МОЖЛИВЕ ВІДКЛЮЧЕННЯ</b>\n\nЧерез {minutes_left} хв можливе припинення подачі електроенергії."
                 elif status_now == 'white' and status_future == 'black':
-                    message = f"⚠️ <b>Увага! Відключення світла</b>\n\nЧерез {minutes_left} хв подача електроенергії буде припинена."
+                    message = f"⚠️ <b>Увага! ВІДКЛЮЧЕННЯ ЕЛЕКТРОЕНЕРГІЇ</b>\n\nЧерез {minutes_left} хв подача електроенергії буде припинена."
                 elif status_now == 'black' and status_future == 'grey':
-                    message = f"✅ <b>Можливе відновлення електроенергії</b>\n\nЧерез {minutes_left} хв можливе відновлення подачі електроенергії."
+                    message = f"✅ <b>МОЖЛИВЕ ВІДНОВЛЕННЯ</b>\n\nЧерез {minutes_left} хв можливе відновлення подачі електроенергії."
                 elif status_now == 'black' and status_future == 'white':
-                    message = f"✅ <b>Відновлення електроенергії</b>\n\nЧерез {minutes_left} хв подача електроенергії буде відновлена."
+                    message = f"✅ <b>ВІДНОВЛЕННЯ ЕЛЕКТРОЕНЕРГІЇ</b>\n\nЧерез {minutes_left} хв подача електроенергії буде відновлена."
                 elif status_now == 'grey' and status_future == 'black':
-                    message = f"⚠️ <b>Підтверджено відключення світла</b>\n\nЧерез {minutes_left} хв подача електроенергії буде припинена."
+                    message = f"⚠️ <b>ГАРАНТОВАНЕ ВІДКЛЮЧЕННЯ</b>\n\nЧерез {minutes_left} хв подача електроенергії буде припинена."
                 elif status_now == 'grey' and status_future == 'white':
-                    message = f"✅ <b>Відновлення електроенергії</b>\n\nЧерез {minutes_left} хв подача електроенергії буде відновлена."
+                    message = f"✅ <b>ВІДНОВЛЕННЯ ЕЛЕКТРОЕНЕРГІЇ</b>\n\nЧерез {minutes_left} хв подача електроенергії буде відновлена."
 
                 if message:
                     event_time = nearest_time.strftime("%H:%M")
                     event_date = nearest_time.strftime("%Y-%m-%d")
                     
                     for uid, addr_name in users:
-                        key = (uid, message, event_time, event_date)
-                        if key not in user_grouped_alerts:
-                            user_grouped_alerts[key] = []
-                        user_grouped_alerts[key].append(addr_name)
+                        full_message = f"{message}\n\nАдреса: <b>{addr_name}</b>."
+                        if uid not in user_alerts:
+                            user_alerts[uid] = []
+                        user_alerts[uid].append((full_message, event_time, event_date))
 
-        # Send alerts, checking for duplicates
+        # Send alerts, checking for duplicates and combining per user
         sent_count = 0
         with get_db_connection() as conn:
             cursor = conn.cursor()
-            for (uid, message, event_time, event_date), addr_list in user_grouped_alerts.items():
-                # Check if already sent
-                cursor.execute('SELECT 1 FROM sent_alerts WHERE user_id=? AND event_time=? AND event_date=?',
-                               (uid, event_time, event_date))
-                if cursor.fetchone():
-                    continue
+            for uid, alerts in user_alerts.items():
+                # Collect unsent messages
+                unsent_messages = []
+                for full_message, event_time, event_date in alerts:
+                    cursor.execute('SELECT 1 FROM sent_alerts WHERE user_id=? AND event_time=? AND event_date=?',
+                                   (uid, event_time, event_date))
+                    if not cursor.fetchone():
+                        unsent_messages.append(full_message)
+                        cursor.execute('INSERT INTO sent_alerts VALUES (?, ?, ?)', (uid, event_time, event_date))
                 
-                # Format addresses text
-                if len(addr_list) == 1:
-                    addr_text = addr_list[0]
-                else:
-                    addr_text = ", ".join(addr_list)
-                
-                # Send message
-                full_message = f"{message}\n\nАдреса: <b>{addr_text}</b>."
-                try:
-                    await bot.send_message(uid, full_message, parse_mode="HTML")
-                    cursor.execute('INSERT INTO sent_alerts VALUES (?, ?, ?)', (uid, event_time, event_date))
-                    sent_count += 1
-                except Exception as e:
-                    logging.error(f"Failed to send alert to {uid}: {e}")
-                await asyncio.sleep(0.05)
+                if unsent_messages:
+                    combined_message = "\n\n".join(unsent_messages)
+                    try:
+                        await bot.send_message(uid, combined_message, parse_mode="HTML")
+                        sent_count += 1  # count as one sent message per user
+                    except Exception as e:
+                        logging.error(f"Failed to send combined alert to {uid}: {e}")
+                    await asyncio.sleep(0.05)
             
             conn.commit()
 
