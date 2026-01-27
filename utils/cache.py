@@ -207,3 +207,7 @@ async def update_clock_time_hands():
         logging.error(f"Error updating clock time hands: {e}")
         import traceback
         traceback.print_exc()
+
+
+def get_cache_data():
+    return load_cached_schedules()
