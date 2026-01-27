@@ -110,39 +110,53 @@ async def check_and_update_cache():
         from utils.monitoring import parse_hoe_smart
         from utils.helpers import normalize_schedule_text
 
-        # Parse fresh data from site
+        # 1. Отримуємо свіжі дані
         all_data = await parse_hoe_smart()
         if not all_data:
             logging.warning("No data received from site during update check")
             return False, {}
 
-        # Load current cache
+        # 2. Завантажуємо поточний кеш
         current_cache = load_cached_schedules()
 
-        # Check if data has changed
         has_changes = False
-                new_cache = {}
-        # Створюємо словник для посилань на картинки
-        global_images = {} 
+        new_cache = {}
+        global_images = {}
+        changes = {}  # Тут ми збираємо: дата -> список змінених черг
 
+        # 3. Аналізуємо дані
         for date_key, data in all_data.items():
-            # Зберігаємо посилання на картинку для цієї дати
+            # Зберігаємо посилання на картинку
             if data.get('img_url'):
                 global_images[date_key] = data['img_url']
-            
+
             if 'schedules' in data and data['schedules']:
                 new_cache[date_key] = {}
-                # ... далі твій існуючий код циклу ...
+                
                 for subqueue, schedule_text in data['schedules'].items():
-                     new_cache[date_key][subqueue] = normalize_schedule_text(schedule_text)
-                     # ... твої перевірки на зміни ...
+                    normalized_text = normalize_schedule_text(schedule_text)
+                    if normalized_text:
+                        new_cache[date_key][subqueue] = normalized_text
 
-        # ПЕРЕД ЗБЕРЕЖЕННЯМ: Додаємо картинки в загальний кеш
-        new_cache["_metadata_"] = {"img_urls": global_images}
+                        # Порівнюємо з тим, що було в кеші
+                        current_schedule = current_cache.get(date_key, {}).get(subqueue, "")
+                        
+                        if normalized_text != current_schedule:
+                            has_changes = True
+                            if date_key not in changes:
+                                changes[date_key] = []
+                            changes[date_key].append(subqueue)
+                            logging.info(f"Schedule changed for {subqueue} on {date_key}")
+
+        if not has_changes:
+            logging.info("No schedule changes detected")
+            return False, {}
+
+        # 4. Зберігаємо оновлення
+        new_cache["global_img"] = global_images  # Спрощений ключ для картинок
         save_cached_schedules(new_cache)
 
-
-        # Generate clocks for changed data
+        # 5. Генеруємо годинники
         await generate_all_clocks_for_cache(new_cache)
         logging.info("Cache and clocks updated")
 
@@ -153,6 +167,7 @@ async def check_and_update_cache():
         import traceback
         traceback.print_exc()
         return False, {}
+
 
 async def generate_all_clocks_for_cache(cached_schedules):
     """Generate clock images for all cached schedules"""
