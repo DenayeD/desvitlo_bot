@@ -68,8 +68,11 @@ async def send_schedule_notifications(changes):
                     # НОВИЙ ГРАФІК НА ЗАВТРА (АБО МАЙБУТНЄ)
                     # Дістаємо URL фото з кешу для цієї дати
                     from utils.cache import get_cache_data
-                    cache = get_cache_data()
-                    img_url = cache.get(date_str, {}).get('img_url')
+                    # У файлі notifications.py
+cache = get_cache_data()
+# Дістаємо URL через наш новий ключ _metadata_
+img_url = cache.get("_metadata_", {}).get("img_urls", {}).get(date_str)
+
 
                     text = (f"📅 <b>НОВИЙ ГРАФІК НА {date_str}</b>\n\n"
                             f"З'явився розклад для ваших адрес:\n{addrs_text}")
