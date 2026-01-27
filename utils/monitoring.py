@@ -6,7 +6,7 @@ from datetime import datetime
 from bs4 import BeautifulSoup
 from config.settings import URL_PAGE
 
-from notifications import send_schedule_notifications
+from utils.notifications import send_schedule_notifications
 
 
 async def send_upcoming_events_notifications():
