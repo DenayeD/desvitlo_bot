@@ -121,37 +121,26 @@ async def check_and_update_cache():
 
         # Check if data has changed
         has_changes = False
-        new_cache = {}
-        changes = {}  # date -> {'new': [], 'changed': []}
+                new_cache = {}
+        # Створюємо словник для посилань на картинки
+        global_images = {} 
 
         for date_key, data in all_data.items():
+            # Зберігаємо посилання на картинку для цієї дати
+            if data.get('img_url'):
+                global_images[date_key] = data['img_url']
+            
             if 'schedules' in data and data['schedules']:
                 new_cache[date_key] = {}
-                changes[date_key] = {'new': [], 'changed': []}
+                # ... далі твій існуючий код циклу ...
                 for subqueue, schedule_text in data['schedules'].items():
-                    normalized_text = normalize_schedule_text(schedule_text)
-                    if normalized_text:
-                        new_cache[date_key][subqueue] = normalized_text
+                     new_cache[date_key][subqueue] = normalize_schedule_text(schedule_text)
+                     # ... твої перевірки на зміни ...
 
-                        # Check if this schedule changed
-                        current_schedule = current_cache.get(date_key, {}).get(subqueue, "")
-                        if normalized_text != current_schedule:
-                            has_changes = True
-                            if not current_schedule:
-                                changes[date_key]['new'].append(subqueue)
-                            else:
-                                changes[date_key]['changed'].append(subqueue)
-                            logging.info(f"Schedule {'new' if not current_schedule else 'changed'} for {subqueue} on {date_key}")
-
-        if not has_changes:
-            logging.info("No schedule changes detected")
-            return False, {}
-
-        # Data changed - update cache and regenerate clocks
-        logging.info(f"Detected changes, updating cache with {len(new_cache)} dates and {sum(len(schedules) for schedules in new_cache.values())} schedules")
-
-        # Save updated cache
+        # ПЕРЕД ЗБЕРЕЖЕННЯМ: Додаємо картинки в загальний кеш
+        new_cache["_metadata_"] = {"img_urls": global_images}
         save_cached_schedules(new_cache)
+
 
         # Generate clocks for changed data
         await generate_all_clocks_for_cache(new_cache)
